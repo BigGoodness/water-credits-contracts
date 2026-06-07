@@ -1,0 +1,18 @@
+[package]
+name = "credit_token"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[lints.rust]
+unexpected_cfgs = "allow"
