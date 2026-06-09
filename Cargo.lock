@@ -1294,6 +1294,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tests"
+version = "0.1.0"
+dependencies = [
+ "credit_factory",
+ "credit_token",
+ "governance",
+ "project_registry",
+ "retirement_registry",
+ "soroban-sdk",
+ "verification_oracle",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"

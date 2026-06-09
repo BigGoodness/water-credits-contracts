@@ -4,7 +4,9 @@ WASM_DIR = target/wasm32-unknown-unknown/release
 .PHONY: build fix-wasm test lint fmt
 
 build:
-	cargo build --target wasm32-unknown-unknown --release
+	for contract in $(CONTRACTS); do \
+		cargo build --target wasm32-unknown-unknown --release -p $$contract; \
+	done
 	$(MAKE) fix-wasm
 
 fix-wasm:
