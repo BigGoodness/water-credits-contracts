@@ -1,0 +1,19 @@
+[package]
+name = "tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+credit_token = { path = "../contracts/credit_token", features = ["testutils"] }
+credit_factory = { path = "../contracts/credit_factory", features = ["testutils"] }
+verification_oracle = { path = "../contracts/verification_oracle", features = ["testutils"] }
+retirement_registry = { path = "../contracts/retirement_registry", features = ["testutils"] }
+project_registry = { path = "../contracts/project_registry", features = ["testutils"] }
+governance = { path = "../contracts/governance", features = ["testutils"] }
+soroban-sdk = "20.0.0"
+
+[lib]
+doctest = false
+
+[lints.rust]
+unexpected_cfgs = "allow"

@@ -23,6 +23,7 @@ pub enum DataKey {
     TotalRetired,
     Record(u64),
     RetireeRecords(Address),
+    AuthorizedCaller(Address),
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -38,6 +39,7 @@ pub struct RetirementRegistry;
 
 #[contractimpl]
 impl RetirementRegistry {
+    /// Initialize the retirement registry with an admin. Callable once.
     pub fn initialize(e: Env, admin: Address) {
         if has_admin(&e) {
             panic!("already initialized");
@@ -47,6 +49,8 @@ impl RetirementRegistry {
         e.storage().instance().set(&DataKey::TotalRetired, &0i128);
     }
 
+    /// Record a retirement. Only callable by admin or an authorized caller contract.
+    /// Returns the unique record ID.
     pub fn record_retirement(
         e: Env,
         caller: Address,
@@ -58,7 +62,8 @@ impl RetirementRegistry {
     ) -> u64 {
         caller.require_auth();
         let stored: Address = read_admin(&e);
-        if caller != stored {
+        let authorized = e.storage().instance().get(&DataKey::AuthorizedCaller(caller.clone())).unwrap_or(false);
+        if caller != stored && !authorized {
             panic!("unauthorized");
         }
 
@@ -105,18 +110,32 @@ impl RetirementRegistry {
         record_id
     }
 
+    /// Get a retirement record by its ID. Returns None if not found.
     pub fn get_record(e: Env, id: u64) -> Option<RetirementRecord> {
         e.storage().instance().get(&DataKey::Record(id))
     }
 
+    /// Get the global total amount of credits retired across all projects.
     pub fn total_retired(e: Env) -> i128 {
         e.storage().instance().get(&DataKey::TotalRetired).unwrap()
     }
 
+    /// Get the total number of retirement records in the registry.
     pub fn record_count(e: Env) -> u64 {
         e.storage().instance().get(&DataKey::RecordCount).unwrap()
     }
 
+    /// Authorize or revoke a contract address to record retirements. Admin only.
+    pub fn set_authorized_caller(e: Env, admin: Address, caller: Address, authorized: bool) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::AuthorizedCaller(caller), &authorized);
+    }
+
+    /// Get all retirement records for a given retiree address.
     pub fn get_retirements_by_retiree(e: Env, retiree: Address) -> Vec<RetirementRecord> {
         let ids: Vec<u64> = e
             .storage()

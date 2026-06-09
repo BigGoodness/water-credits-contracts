@@ -1,7 +1,10 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Symbol,
+    Val, Vec,
 };
+
+use soroban_sdk::IntoVal;
 
 #[cfg(test)]
 extern crate std;
@@ -38,6 +41,8 @@ pub enum DataKey {
     Balance(Address),
     Allowance(Address, Address),
     Admin,
+    Minter,
+    RetirementRegistry,
     TotalSupply,
     TotalRetired,
     Name,
@@ -54,6 +59,22 @@ fn has_admin(e: &Env) -> bool {
 
 fn read_admin(e: &Env) -> Address {
     e.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+fn read_minter(e: &Env) -> Address {
+    e.storage()
+        .instance()
+        .get(&DataKey::Minter)
+        .unwrap_or_else(|| read_admin(e))
+}
+
+fn require_minter(e: &Env, caller: &Address) {
+    caller.require_auth();
+    let minter = read_minter(e);
+    let admin = read_admin(e);
+    if *caller != minter && *caller != admin {
+        panic!("unauthorized minter");
+    }
 }
 
 fn read_balance(e: &Env, addr: &Address) -> i128 {
@@ -87,6 +108,7 @@ pub struct CreditToken;
 
 #[contractimpl]
 impl CreditToken {
+    /// Initialize the token with project metadata. Callable once by the deploying admin.
     pub fn initialize(
         e: Env,
         admin: Address,
@@ -115,6 +137,7 @@ impl CreditToken {
         e.storage().instance().set(&DataKey::CertCount, &0u64);
     }
 
+    /// Transfer contract admin rights to a new address.
     pub fn set_admin(e: Env, admin: Address, new_admin: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -124,15 +147,32 @@ impl CreditToken {
         e.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 
-    pub fn mint_to(e: Env, admin: Address, to: Address, amount: i128) {
+    /// Designate the address allowed to mint credits (typically the verification oracle).
+    pub fn set_minter(e: Env, admin: Address, minter: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Minter, &minter);
+    }
+
+    /// Link the global retirement registry for on-chain retirement recording.
+    pub fn set_retirement_registry(e: Env, admin: Address, registry: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::RetirementRegistry, &registry);
+    }
+
+    /// Mint new credits to a beneficiary. Callable by admin or designated minter.
+    pub fn mint_to(e: Env, minter: Address, to: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        admin.require_auth();
-        let stored: Address = read_admin(&e);
-        if admin != stored {
-            panic!("unauthorized");
-        }
+        require_minter(&e, &minter);
 
         let balance = read_balance(&e, &to);
         let total: i128 = e
@@ -148,6 +188,7 @@ impl CreditToken {
         e.events().publish((EVENT_MINTED,), (to, amount));
     }
 
+    /// Burn credits from a holder. Admin only.
     pub fn burn(e: Env, admin: Address, from: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
@@ -173,6 +214,7 @@ impl CreditToken {
             .set(&DataKey::TotalSupply, &(total - amount));
     }
 
+    /// Transfer credits between wallets.
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
@@ -190,6 +232,7 @@ impl CreditToken {
         e.events().publish((EVENT_XFER,), (from, to, amount));
     }
 
+    /// Transfer credits on behalf of an approved holder.
     pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
@@ -210,6 +253,7 @@ impl CreditToken {
         save_balance(&e, &to, to_balance.checked_add(amount).expect("overflow"));
     }
 
+    /// Approve a spender to transfer up to `amount` credits.
     pub fn approve(e: Env, from: Address, spender: Address, amount: i128, _expiration_ledger: u32) {
         if amount < 0 {
             panic!("amount must be non-negative");
@@ -218,6 +262,7 @@ impl CreditToken {
         save_allowance(&e, &from, &spender, amount);
     }
 
+    /// Permanently retire credits and optionally record in the retirement registry.
     pub fn retire(
         e: Env,
         holder: Address,
@@ -255,6 +300,7 @@ impl CreditToken {
             .set(&DataKey::TotalRetired, &(total_retired + amount));
 
         let metadata: CreditMetadata = e.storage().instance().get(&DataKey::Metadata).unwrap();
+        let project_id = metadata.project_id.clone();
         let cert_count: u64 = e
             .storage()
             .instance()
@@ -266,9 +312,9 @@ impl CreditToken {
             retiree: holder.clone(),
             project_id: metadata.project_id,
             amount,
-            purpose,
+            purpose: purpose.clone(),
             timestamp,
-            metadata_uri,
+            metadata_uri: metadata_uri.clone(),
         };
         e.storage()
             .instance()
@@ -278,7 +324,24 @@ impl CreditToken {
             .set(&DataKey::CertCount, &(cert_count + 1));
 
         e.events()
-            .publish((EVENT_RETIRED,), (holder, amount, cert.clone()));
+            .publish((EVENT_RETIRED,), (holder.clone(), amount, cert.clone()));
+
+        if let Some(registry) = e.storage().instance().get::<_, Address>(&DataKey::RetirementRegistry) {
+            let record_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                holder.to_val(),
+                project_id.to_val(),
+                amount.into_val(&e),
+                purpose.to_val(),
+                metadata_uri.to_val(),
+            ];
+            e.invoke_contract::<Val>(
+                &registry,
+                &Symbol::new(&e, "record_retirement"),
+                record_args,
+            );
+        }
 
         cert
     }

@@ -1,6 +1,8 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol,
+    Val, Vec,
 };
 
 #[cfg(test)]
@@ -21,6 +23,13 @@ pub struct ReadingSubmission {
     pub temperature: i64,
     pub total_nitrogen: i64,
     pub total_phosphorus: i64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectConfig {
+    pub token_contract: Address,
+    pub beneficiary: Address,
 }
 
 #[contracttype]
@@ -66,6 +75,7 @@ pub enum DataKey {
     WindowState(BytesN<32>),
     OracleSubmitted(BytesN<32>, Address),
     LastResult(BytesN<32>),
+    ProjectConfig(BytesN<32>),
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -97,7 +107,7 @@ fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
         }
     }
     let len = sorted.len();
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
         sorted.get(len / 2).unwrap()
@@ -122,7 +132,7 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
         }
     }
     let len = sorted.len();
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
         sorted.get(len / 2).unwrap()
@@ -133,7 +143,9 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
 pub struct VerificationOracle;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl VerificationOracle {
+    /// Initialize the oracle contract with an admin and default config. Callable once.
     pub fn initialize(e: Env, admin: Address) {
         if has_admin(&e) {
             panic!("already initialized");
@@ -154,6 +166,7 @@ impl VerificationOracle {
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
+    /// Add an oracle address to the whitelist. Only admin can call.
     pub fn add_oracle(e: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -176,6 +189,7 @@ impl VerificationOracle {
             .set(&DataKey::OracleCount, &(count + 1));
     }
 
+    /// Remove an oracle from the whitelist. Must maintain at least min_oracles.
     pub fn remove_oracle(e: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -201,6 +215,7 @@ impl VerificationOracle {
             .set(&DataKey::OracleCount, &(count - 1));
     }
 
+    /// Check if an oracle address is whitelisted and active.
     pub fn is_oracle_active(e: Env, oracle: Address) -> bool {
         e.storage()
             .instance()
@@ -208,6 +223,10 @@ impl VerificationOracle {
             .unwrap_or(false)
     }
 
+    /// Submit a sensor reading for a project. Uses nonce-based replay protection.
+    /// When min_oracles submissions are collected, computes median values, calculates
+    /// nutrient removal, quality penalty, and volumetric credits. If a ProjectConfig
+    /// is set, automatically mints credits to the configured beneficiary.
     pub fn submit_reading(
         e: Env,
         oracle: Address,
@@ -221,6 +240,37 @@ impl VerificationOracle {
         total_nitrogen: i64,
         total_phosphorus: i64,
     ) -> Option<VerificationResult> {
+        let result = Self::submit_reading_impl(e.clone(), oracle, project_id.clone(), nonce, ph, turbidity, dissolved_oxygen, flow_rate, temperature, total_nitrogen, total_phosphorus);
+        if let Some(ref res) = result {
+            if let Some(config) = e.storage().instance().get::<_, ProjectConfig>(&DataKey::ProjectConfig(project_id)) {
+                let mint_args: Vec<Val> = vec![
+                    &e,
+                    e.current_contract_address().to_val(),
+                    config.beneficiary.to_val(),
+                    res.total_credits.into_val(&e),
+                ];
+                e.invoke_contract::<()>(
+                    &config.token_contract,
+                    &Symbol::new(&e, "mint_to"),
+                    mint_args,
+                );
+            }
+        }
+        result
+    }
+fn submit_reading_impl(
+    e: Env,
+    oracle: Address,
+    project_id: BytesN<32>,
+    nonce: u64,
+    ph: i64,
+    turbidity: i64,
+    dissolved_oxygen: i64,
+    flow_rate: i64,
+    temperature: i64,
+    total_nitrogen: i64,
+    total_phosphorus: i64,
+) -> Option<VerificationResult> {
         oracle.require_auth();
 
         if !e.storage()
@@ -402,16 +452,36 @@ impl VerificationOracle {
         }
     }
 
+    /// Configure the credit token contract and beneficiary for a project.
+    /// When enabled, the oracle will auto-mint credits to the beneficiary upon verification finalization.
+    pub fn set_project_config(e: Env, admin: Address, project_id: BytesN<32>, token_contract: Address, beneficiary: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let config = ProjectConfig { token_contract, beneficiary };
+        e.storage().instance().set(&DataKey::ProjectConfig(project_id), &config);
+    }
+
+    /// Get the project config (token contract and beneficiary) for a project.
+    pub fn get_project_config(e: Env, project_id: BytesN<32>) -> Option<ProjectConfig> {
+        e.storage().instance().get(&DataKey::ProjectConfig(project_id))
+    }
+
+    /// Get the last verification result for a project. Returns None if no window has been finalized.
     pub fn get_last_result(e: Env, project_id: BytesN<32>) -> Option<VerificationResult> {
         e.storage()
             .instance()
             .get(&DataKey::LastResult(project_id))
     }
 
+    /// Get the current oracle configuration parameters.
     pub fn get_config(e: Env) -> OracleConfig {
         read_config(&e)
     }
 
+    /// Update the oracle configuration (min/max oracles, quality thresholds, credit rates). Admin only.
     pub fn update_config(e: Env, admin: Address, config: OracleConfig) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
