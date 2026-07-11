@@ -23,6 +23,7 @@ pub enum DataKey {
     TotalRetired,
     Record(u64),
     RetireeRecords(Address),
+    ProjectRecords(BytesN<32>),
     AuthorizedCaller(Address),
 }
 
@@ -99,6 +100,16 @@ impl RetirementRegistry {
             .instance()
             .set(&DataKey::RetireeRecords(retiree.clone()), &retiree_ids);
 
+        let mut project_ids: Vec<u64> = e
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectRecords(project_id.clone()))
+            .unwrap_or(Vec::new(&e));
+        project_ids.push_back(record_id);
+        e.storage()
+            .instance()
+            .set(&DataKey::ProjectRecords(project_id.clone()), &project_ids);
+
         let total: i128 = e.storage().instance().get(&DataKey::TotalRetired).unwrap();
         e.storage()
             .instance()
@@ -141,6 +152,25 @@ impl RetirementRegistry {
             .storage()
             .instance()
             .get(&DataKey::RetireeRecords(retiree))
+            .unwrap_or(Vec::new(&e));
+
+        let mut records: Vec<RetirementRecord> = Vec::new(&e);
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if let Some(record) = e.storage().instance().get(&DataKey::Record(id)) {
+                records.push_back(record);
+            }
+        }
+        records
+    }
+
+    /// Get all retirement records for a given project ID.
+    /// Useful for computing total retired supply per project and for audit trails.
+    pub fn get_retirements_by_project(e: Env, project_id: BytesN<32>) -> Vec<RetirementRecord> {
+        let ids: Vec<u64> = e
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectRecords(project_id))
             .unwrap_or(Vec::new(&e));
 
         let mut records: Vec<RetirementRecord> = Vec::new(&e);
@@ -253,6 +283,43 @@ mod tests {
         let (e, _admin, client) = setup();
         let retiree = Address::generate(&e);
         let records = client.get_retirements_by_retiree(&retiree);
+        assert_eq!(records.len(), 0);
+    }
+
+    #[test]
+    fn test_get_retirements_by_project_single() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree1 = Address::generate(&e);
+        let retiree2 = Address::generate(&e);
+        let project_a = BytesN::from_array(&e, &[1u8; 32]);
+        let project_b = BytesN::from_array(&e, &[2u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        client.record_retirement(&admin, &retiree1, &project_a, &300, &purpose, &uri);
+        client.record_retirement(&admin, &retiree2, &project_a, &200, &purpose, &uri);
+        client.record_retirement(&admin, &retiree1, &project_b, &100, &purpose, &uri);
+
+        let proj_a_records = client.get_retirements_by_project(&project_a);
+        assert_eq!(proj_a_records.len(), 2);
+
+        let total_a: i128 = (0..proj_a_records.len())
+            .map(|i| proj_a_records.get(i as u32).unwrap().amount)
+            .sum();
+        assert_eq!(total_a, 500);
+
+        let proj_b_records = client.get_retirements_by_project(&project_b);
+        assert_eq!(proj_b_records.len(), 1);
+        assert_eq!(proj_b_records.get(0).unwrap().amount, 100);
+    }
+
+    #[test]
+    fn test_get_retirements_by_project_empty() {
+        let (e, _admin, client) = setup();
+        let project_id = BytesN::from_array(&e, &[0xffu8; 32]);
+        let records = client.get_retirements_by_project(&project_id);
         assert_eq!(records.len(), 0);
     }
 }
