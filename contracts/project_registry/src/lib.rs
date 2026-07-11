@@ -175,6 +175,27 @@ impl ProjectRegistry {
         }
         projects
     }
+
+    /// Transfer ownership of a project to a new address.
+    /// Only the current project owner or the admin can call this.
+    pub fn update_owner(e: Env, caller: Address, project_id: BytesN<32>, new_owner: Address) {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let mut project: ProjectEntry = e
+            .storage()
+            .instance()
+            .get(&DataKey::Project(project_id.clone()))
+            .unwrap_or_else(|| panic!("project not found"));
+
+        if caller != admin && caller != project.owner {
+            panic!("unauthorized");
+        }
+
+        project.owner = new_owner;
+        e.storage()
+            .instance()
+            .set(&DataKey::Project(project_id), &project);
+    }
 }
 
 #[cfg(test)]
@@ -319,5 +340,49 @@ mod tests {
         let (_e, _admin, client) = setup();
         let all = client.list_all();
         assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn test_update_owner_by_admin() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let new_owner = Address::generate(&e);
+        let id = client.register(
+            &admin,
+            &String::from_str(&e, "Owner Test"),
+            &38897700,
+            &(-77036500),
+            &String::from_str(&e, "v1"),
+            &owner,
+            &500,
+        );
+
+        client.update_owner(&admin, &id, &new_owner);
+        let project = client.get(&id).unwrap();
+        assert_eq!(project.owner, new_owner);
+    }
+
+    #[test]
+    fn test_update_owner_by_current_owner() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let new_owner = Address::generate(&e);
+        let id = client.register(
+            &admin,
+            &String::from_str(&e, "Owner Transfer"),
+            &38897700,
+            &(-77036500),
+            &String::from_str(&e, "v1"),
+            &owner,
+            &500,
+        );
+
+        client.update_owner(&owner, &id, &new_owner);
+        let project = client.get(&id).unwrap();
+        assert_eq!(project.owner, new_owner);
     }
 }

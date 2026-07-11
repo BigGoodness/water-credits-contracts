@@ -201,6 +201,27 @@ impl CreditFactory {
             .get(&DataKey::ProjectCount)
             .unwrap()
     }
+
+    /// Transfer project ownership to a new wallet address.
+    /// Can be called by admin or the current project owner.
+    pub fn update_project_owner(e: Env, caller: Address, project_id: BytesN<32>, new_owner: Address) {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let mut project: ProjectInfo = e
+            .storage()
+            .instance()
+            .get(&DataKey::Project(project_id.clone()))
+            .unwrap_or_else(|| panic!("project not found"));
+
+        if caller != admin && caller != project.owner {
+            panic!("unauthorized");
+        }
+
+        project.owner = new_owner;
+        e.storage()
+            .instance()
+            .set(&DataKey::Project(project_id), &project);
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +439,53 @@ mod tests {
             let project = client.get_project(&project_id).unwrap();
             assert_eq!(project.status, status);
         }
+    }
+
+    #[test]
+    fn test_update_project_owner_by_admin() {
+        let (e, admin, owner, wasm_hash, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let name = String::from_str(&e, "Ownership Test");
+        let methodology = String::from_str(&e, "Test_v1");
+        let project_id = client.register_project(
+            &admin,
+            &name,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &100,
+            &wasm_hash,
+        );
+
+        let new_owner = Address::generate(&e);
+        client.update_project_owner(&admin, &project_id, &new_owner);
+        let project = client.get_project(&project_id).unwrap();
+        assert_eq!(project.owner, new_owner);
+    }
+
+    #[test]
+    fn test_update_project_owner_by_current_owner() {
+        let (e, admin, owner, wasm_hash, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let name = String::from_str(&e, "Owner Self-Transfer");
+        let methodology = String::from_str(&e, "Test_v1");
+        let project_id = client.register_project(
+            &admin,
+            &name,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &100,
+            &wasm_hash,
+        );
+
+        let new_owner = Address::generate(&e);
+        client.update_project_owner(&owner, &project_id, &new_owner);
+        let project = client.get_project(&project_id).unwrap();
+        assert_eq!(project.owner, new_owner);
     }
 }
