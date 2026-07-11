@@ -76,6 +76,8 @@ pub enum DataKey {
     OracleSubmitted(BytesN<32>, Address),
     LastResult(BytesN<32>),
     ProjectConfig(BytesN<32>),
+    OracleSubmitCount(Address),
+    TotalSubmissions,
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -294,6 +296,24 @@ fn submit_reading_impl(
             .instance()
             .set(&DataKey::OracleNonce(oracle.clone()), &nonce);
 
+        // Track per-oracle and global submission counts
+        let oracle_count: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleSubmitCount(oracle.clone()))
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleSubmitCount(oracle.clone()), &(oracle_count + 1));
+        let total: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSubmissions)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalSubmissions, &(total + 1));
+
         // Prevent duplicate oracle per window
         if e.storage()
             .instance()
@@ -479,6 +499,22 @@ fn submit_reading_impl(
     /// Get the current oracle configuration parameters.
     pub fn get_config(e: Env) -> OracleConfig {
         read_config(&e)
+    }
+
+    /// Get the total number of readings an oracle has submitted across all projects and windows.
+    pub fn oracle_submit_count(e: Env, oracle: Address) -> u64 {
+        e.storage()
+            .instance()
+            .get(&DataKey::OracleSubmitCount(oracle))
+            .unwrap_or(0)
+    }
+
+    /// Get the total number of readings submitted by all oracles across all time.
+    pub fn total_submissions(e: Env) -> u64 {
+        e.storage()
+            .instance()
+            .get(&DataKey::TotalSubmissions)
+            .unwrap_or(0)
     }
 
     /// Update the oracle configuration (min/max oracles, quality thresholds, credit rates). Admin only.
@@ -733,5 +769,60 @@ mod tests {
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().quality_penalty, 7000); // 2000+2000+2000+1000=7000
+    }
+
+    #[test]
+    fn test_oracle_submit_count_increments() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        assert_eq!(client.oracle_submit_count(&o1), 0);
+        assert_eq!(client.total_submissions(), 0);
+
+        let project_id = BytesN::from_array(&e, &[10u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        assert_eq!(client.oracle_submit_count(&o1), 1);
+        assert_eq!(client.total_submissions(), 1);
+
+        let project_id2 = BytesN::from_array(&e, &[11u8; 32]);
+        client.submit_reading(&o2, &project_id2, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o3, &project_id2, &1, &700, &10, &80, &500, &250, &8, &1);
+        assert_eq!(client.oracle_submit_count(&o2), 1);
+        assert_eq!(client.oracle_submit_count(&o3), 1);
+        assert_eq!(client.total_submissions(), 3);
+    }
+
+    #[test]
+    fn test_total_submissions_accumulates_across_oracles() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let p1 = BytesN::from_array(&e, &[20u8; 32]);
+        let p2 = BytesN::from_array(&e, &[21u8; 32]);
+        let p3 = BytesN::from_array(&e, &[22u8; 32]);
+
+        // 3 oracles × 3 different windows = 9 total submissions but nonce is per-oracle
+        client.submit_reading(&o1, &p1, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o1, &p2, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o1, &p3, &3, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &p1, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        assert_eq!(client.oracle_submit_count(&o1), 3);
+        assert_eq!(client.oracle_submit_count(&o2), 1);
+        assert_eq!(client.total_submissions(), 4);
     }
 }
