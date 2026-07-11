@@ -526,6 +526,61 @@ fn submit_reading_impl(
         }
         e.storage().instance().set(&DataKey::Config, &config);
     }
+
+    /// Reset the open submission window for a project, clearing all pending oracle submissions.
+    /// This allows oracles to resubmit for the same project in a new window, e.g. after a
+    /// sensor error or stale data invalidation. Only callable by admin.
+    /// Does not affect already-finalized results or oracle nonces.
+    pub fn reset_window(e: Env, admin: Address, project_id: BytesN<32>) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+
+        let window: Option<WindowState> = e
+            .storage()
+            .instance()
+            .get(&DataKey::WindowState(project_id.clone()));
+
+        match window {
+            None => panic!("no window found for project"),
+            Some(ref w) if w.finalized => panic!("window already finalized"),
+            _ => {}
+        }
+
+        // Remove the OracleSubmitted markers for all oracles in this window
+        let window = window.unwrap();
+        for i in 0..window.submissions.len() {
+            let sub = window.submissions.get(i).unwrap();
+            e.storage()
+                .instance()
+                .remove(&DataKey::OracleSubmitted(project_id.clone(), sub.oracle));
+        }
+
+        // Replace with a fresh empty window
+        let fresh = WindowState {
+            submissions: Vec::new(&e),
+            finalized: false,
+        };
+        e.storage()
+            .instance()
+            .set(&DataKey::WindowState(project_id.clone()), &fresh);
+    }
+
+    /// Get the number of submissions in the current open window for a project.
+    /// Returns 0 if no window exists or the window was already finalized.
+    pub fn window_submission_count(e: Env, project_id: BytesN<32>) -> u32 {
+        let window: Option<WindowState> = e
+            .storage()
+            .instance()
+            .get(&DataKey::WindowState(project_id));
+        match window {
+            None => 0,
+            Some(w) if w.finalized => 0,
+            Some(w) => w.submissions.len(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -824,5 +879,55 @@ mod tests {
         assert_eq!(client.oracle_submit_count(&o1), 3);
         assert_eq!(client.oracle_submit_count(&o2), 1);
         assert_eq!(client.total_submissions(), 4);
+    }
+
+    #[test]
+    fn test_reset_window_clears_submissions() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[30u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        assert_eq!(client.window_submission_count(&project_id), 2);
+
+        client.reset_window(&admin, &project_id);
+        assert_eq!(client.window_submission_count(&project_id), 0);
+    }
+
+    #[test]
+    fn test_oracles_can_resubmit_after_reset() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[31u8; 32]);
+        // Submit two readings
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        // Reset
+        client.reset_window(&admin, &project_id);
+
+        // All three oracles can submit fresh (using next nonces)
+        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let result = client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().oracle_count, 3);
     }
 }
