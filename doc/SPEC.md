@@ -1,24 +1,309 @@
-# Water Credits Smart Contracts
+# Water Credits Smart Contracts — Formal Specification
 
-## Contracts
+## 1. Overview
+
+Six Soroban smart contracts implement the on-chain logic for the Water Quality &
+Replenishment Credits protocol. Each contract handles a distinct responsibility
+and communicates with the others via cross-contract calls.
+
+| Contract | Responsibility |
+|---|---|
+| `credit_token` | Per-project fungible credit asset |
+| `credit_factory` | Deploys and indexes project credit tokens |
+| `verification_oracle` | Aggregates sensor readings, computes and mints credits |
+| `retirement_registry` | Immutable global retirement ledger |
+| `project_registry` | On-chain project metadata directory |
+| `governance` | Protocol parameters and multisig DAO |
+
+---
+
+## 2. Contract Specifications
+
+### 2.1 credit_token
+
+Each water restoration project has its own `credit_token` instance deployed by
+the factory. Credits are transferable and retirable.
+
+#### Public interface
+
+| Function | Auth | Description |
+|---|---|---|
+| `initialize(admin, name, symbol, project_id, methodology)` | None (once) | Set up token |
+| `mint_to(minter, to, amount)` | minter or admin | Mint credits, respects MaxSupply cap |
+| `batch_mint_to(minter, recipients, amounts)` | minter or admin | Mint to multiple addresses atomically |
+| `burn(admin, from, amount)` | admin | Destroy credits without retirement record |
+| `transfer(from, to, amount)` | from | Move credits between wallets |
+| `transfer_from(spender, from, to, amount)` | spender | Move credits via allowance |
+| `approve(from, spender, amount, expiration_ledger)` | from | Grant allowance |
+| `retire(holder, amount, purpose, metadata_uri)` | holder | Permanently retire credits → certificate |
+| `set_admin(admin, new_admin)` | admin | Rotate admin key |
+| `set_minter(admin, minter)` | admin | Delegate minting authority |
+| `set_retirement_registry(admin, registry)` | admin | Link global retirement ledger |
+| `set_max_supply(admin, max)` | admin | Set per-project credit ceiling (0 = uncapped) |
+| `pause(admin)` | admin | Halt all mutable operations |
+| `unpause(admin)` | admin | Resume operations |
+| `balance(addr)` | — | Query balance |
+| `total_supply()` | — | Total credits minted minus burned |
+| `total_retired()` | — | Total credits permanently retired |
+| `max_supply()` | — | Current supply ceiling |
+| `paused()` | — | Whether the contract is paused |
+| `allowance(from, spender)` | — | Current approved amount |
+| `name()` / `symbol()` / `decimals()` | — | Token metadata |
+| `metadata()` | — | Project credit metadata |
+| `get_certificate(index)` | — | Retrieve retirement certificate |
+
+#### Pause semantics
+
+While paused, `mint_to`, `batch_mint_to`, `transfer`, `transfer_from`, and
+`retire` all panic with `"contract is paused"`. Read-only queries remain
+available. The pause does not persist across upgrades — re-initialization would
+clear it.
+
+#### Supply cap semantics
+
+`set_max_supply(admin, max)` sets the ceiling. `max = 0` means uncapped. Both
+`mint_to` and `batch_mint_to` check `total_supply + amount > max` **before**
+writing any state, so partial batch mints cannot occur.
+
+---
+
+### 2.2 verification_oracle
+
+The oracle contract collects sensor readings from whitelisted oracle nodes,
+aggregates them using median statistics, computes credit-equivalent impact,
+and optionally triggers an auto-mint to the project beneficiary.
+
+#### Oracle window lifecycle
+
+A **window** is a single aggregation round for one project. The lifecycle:
+
+```
+  OPEN                       FINALIZED
+┌──────────────────────┐    ┌───────────────────────────┐
+│  WindowState          │    │  WindowState               │
+│  submissions: []      │ →  │  submissions: [s1,s2,s3]  │
+│  finalized: false     │    │  finalized: true           │
+└──────────────────────┘    └───────────────────────────┘
+       ↑                              ↑
+  oracle submits              len(submissions) >= min_oracles
+  (dedup enforced)            → compute median → emit event
+                              → store LastResult
+                              → optional auto-mint
+```
+
+State transitions:
+
+1. **No window** — `get_last_result` returns `None`, `window_submission_count` returns 0.
+2. **Open window** — An oracle calls `submit_reading`. A `WindowState` entry is
+   created/updated. `OracleSubmitted(project_id, oracle)` is set to prevent the
+   same oracle from submitting twice to the same window.
+3. **Finalized window** — Once `submissions.len() >= config.min_oracles`, the
+   contract computes median sensor values, evaluates the credit formula, stores
+   a `VerificationResult` under `LastResult(project_id)`, marks `finalized = true`,
+   and emits a `("rdng_vrfy",)` event. Subsequent `submit_reading` calls for the
+   same project panic with `"window already finalized"`.
+4. **Reset** — Admin calls `reset_window(admin, project_id)`. The
+   `OracleSubmitted` markers for all oracles that submitted to that window are
+   removed, and a fresh empty `WindowState` replaces the old one. Oracle nonces
+   are **not** reset. A new open window begins.
+
+#### Nonce replay protection
+
+Each oracle has a monotonically-increasing nonce stored under
+`OracleNonce(oracle)`. On each `submit_reading` call the contract checks
+`nonce == stored + 1`. If the check fails the call panics with
+`"invalid nonce"`. This prevents replay of old readings.
+
+#### Submission statistics
+
+The contract records:
+- `OracleSubmitCount(oracle)` — total accepted submissions by this oracle.
+- `TotalSubmissions` — global total across all oracles.
+
+These are incremented after nonce validation, regardless of whether the window
+finalizes.
+
+#### Credit calculation (summary)
+
+Given medians of all sensor fields across the `min_oracles` submissions:
+
+```
+N_removed = max(0, baseline_N - med_N) * med_flow * 3600 / 1_000_000   (kg)
+P_removed = max(0, baseline_P - med_P) * med_flow * 3600 / 1_000_000   (kg)
+
+quality_penalty = 0..8000 bps based on pH, turbidity, DO, temperature
+
+volumetric_credit = med_flow * 100 / 1000
+
+gross = N_removed * credit_per_kg_n + P_removed * credit_per_kg_p + volumetric_credit
+total = gross * (10_000 - quality_penalty) / 10_000
+```
+
+All sensor values are fixed-point integers (see MATH.md for scale factors).
+
+#### Public interface additions (this version)
+
+| Function | Auth | Description |
+|---|---|---|
+| `reset_window(admin, project_id)` | admin | Clear pending window so oracles can resubmit |
+| `window_submission_count(project_id)` | — | Current pending submission count |
+| `oracle_submit_count(oracle)` | — | Lifetime submission count for an oracle |
+| `total_submissions()` | — | Global lifetime submission count |
+
+---
+
+### 2.3 retirement_registry
+
+Immutable append-only ledger of all credit retirements across all projects.
+
+#### Indexes
+
+Records are indexed by two secondary indexes for efficient retrieval:
+
+- `RetireeRecords(Address)` → `Vec<u64>` of record IDs for a given retiree.
+- `ProjectRecords(BytesN<32>)` → `Vec<u64>` of record IDs for a given project.
+
+Both indexes are updated atomically with the record write in
+`record_retirement`.
+
+#### Public interface
+
+| Function | Auth | Description |
+|---|---|---|
+| `initialize(admin)` | None (once) | Set up registry |
+| `record_retirement(caller, retiree, project_id, amount, purpose, metadata_uri)` | admin or authorized | Append record, update indexes |
+| `set_authorized_caller(admin, caller, authorized)` | admin | Whitelist a contract address |
+| `get_record(id)` | — | Fetch record by sequential ID |
+| `total_retired()` | — | Global sum of retired credits |
+| `record_count()` | — | Total number of records |
+| `get_retirements_by_retiree(retiree)` | — | All records for an address |
+| `get_retirements_by_project(project_id)` | — | All records for a project |
+
+---
+
+### 2.4 project_registry
+
+On-chain metadata directory. Projects are registered by the admin and can be
+queried or listed by any caller.
+
+#### Public interface additions (this version)
+
+| Function | Auth | Description |
+|---|---|---|
+| `update_owner(caller, project_id, new_owner)` | admin or current owner | Transfer project ownership |
+
+---
+
+### 2.5 credit_factory
+
+Deploys new `credit_token` instances and maintains a project index.
+
+#### Public interface additions (this version)
+
+| Function | Auth | Description |
+|---|---|---|
+| `update_project_owner(caller, project_id, new_owner)` | admin or current owner | Transfer project ownership in factory index |
+
+---
+
+### 2.6 governance
+
+DAO for protocol parameter management. Members propose, vote, and execute
+changes after a timelock. Voting is majority-based with a configurable
+approval threshold.
+
+---
+
+## 3. Access Control Summary
+
+| Role | Who | Capabilities |
+|---|---|---|
+| Admin | Contract deployer / multisig | Pause/unpause, set max supply, oracle whitelist, project status, config updates |
+| Minter | Designated address (typically oracle) | `mint_to`, `batch_mint_to` |
+| Oracle | Whitelisted oracle nodes | `submit_reading` |
+| Project owner | Registered developer wallet | `update_owner` / `update_project_owner` |
+| Credit holder | Any address with credits | `transfer`, `approve`, `retire` |
+| Anyone | Public | All read-only queries |
+
+---
+
+## 4. Storage Layout Summary
 
 ### credit_token
-- `initialize(admin, name, symbol)` — Initialize the token
-- `mint(to, amount)` — Mint tokens (admin only)
-- `burn(from, amount)` — Burn tokens (admin only)
-- `transfer(from, to, amount)` — Transfer tokens
-- `transfer_from(spender, from, to, amount)` — Transfer with allowance
-- `approve(from, spender, amount, expiration_ledger)` — Approve spender
-- `balance(addr)` — Get balance
-- `total_supply()` — Get total supply
-- `allowance(from, spender)` — Get allowance
-- `name()` — Get token name
-- `symbol()` — Get token symbol
-- `decimals()` — Get decimals (7)
-- `set_admin(new_admin)` — Change admin
 
-### credit_factory
+| Key | Type | Notes |
+|---|---|---|
+| `Admin` | `Address` | Contract admin |
+| `Minter` | `Address` | Optional minting delegate |
+| `RetirementRegistry` | `Address` | Optional linked registry |
+| `TotalSupply` | `i128` | Ever minted minus burned |
+| `TotalRetired` | `i128` | Ever retired |
+| `MaxSupply` | `i128` | 0 = uncapped |
+| `Paused` | `bool` | Emergency halt flag |
+| `Name` / `Symbol` / `Decimals` | string/u32 | Token metadata |
+| `Metadata` | `CreditMetadata` | Project metadata at init |
+| `Balance(Address)` | `i128` | Per-address balance |
+| `Allowance(Address, Address)` | `i128` | Spender allowance |
+| `Cert(u64)` | `RetirementCertificate` | Indexed certificates |
+| `CertCount` | `u64` | Certificate counter |
+
 ### verification_oracle
+
+| Key | Type | Notes |
+|---|---|---|
+| `Admin` | `Address` | Contract admin |
+| `OracleActive(Address)` | `bool` | Whitelist entry |
+| `OracleCount` | `u32` | Whitelist size |
+| `Config` | `OracleConfig` | Protocol parameters |
+| `OracleNonce(Address)` | `u64` | Last accepted nonce per oracle |
+| `OracleSubmitted(BytesN<32>, Address)` | `bool` | Dedup: oracle × window |
+| `OracleSubmitCount(Address)` | `u64` | Lifetime submission count |
+| `TotalSubmissions` | `u64` | Protocol-wide submission count |
+| `WindowState(BytesN<32>)` | `WindowState` | Open/finalized window |
+| `LastResult(BytesN<32>)` | `VerificationResult` | Latest finalized result |
+| `ProjectConfig(BytesN<32>)` | `ProjectConfig` | Auto-mint config |
+
 ### retirement_registry
-### project_registry
-### governance
+
+| Key | Type | Notes |
+|---|---|---|
+| `Admin` | `Address` | Registry admin |
+| `RecordCount` | `u64` | Total records |
+| `TotalRetired` | `i128` | Global sum |
+| `Record(u64)` | `RetirementRecord` | Record by ID |
+| `RetireeRecords(Address)` | `Vec<u64>` | Index by retiree |
+| `ProjectRecords(BytesN<32>)` | `Vec<u64>` | Index by project |
+| `AuthorizedCaller(Address)` | `bool` | Authorized contract |
+
+---
+
+## 5. Invariants
+
+The following properties must hold at all times:
+
+1. **Supply conservation**: `total_supply + total_retired == sum(balances) + sum(burned_via_admin)`
+2. **No over-mint**: `total_supply <= max_supply` (when max_supply > 0)
+3. **Nonce monotonicity**: `OracleNonce[oracle]` never decreases
+4. **Window finality**: A finalized window's `finalized = true` is never reverted
+   (reset_window only operates on non-finalized windows)
+5. **Retirement immutability**: Records in `retirement_registry` are
+   append-only; no record is ever modified or deleted
+6. **Deduplication**: An oracle cannot submit twice to the same open window
+   for the same project
+
+---
+
+## 6. Events
+
+| Event topic | Contract | Payload | When |
+|---|---|---|---|
+| `minted` | `credit_token` | `(to, amount)` | Per mint (including batch) |
+| `xfer` | `credit_token` | `(from, to, amount)` | Transfer |
+| `retired` | `credit_token` | `(holder, amount, certificate)` | Retire |
+| `proj_reg` | `credit_factory` | `(project_id,)` | Project registered |
+| `rdng_vrfy` | `verification_oracle` | `(project_id, result)` | Window finalized |
+| `prop_crt` | `governance` | `(proposal_id, proposer)` | Proposal created |
+| `vote_cst` | `governance` | `(proposal_id, voter, approve)` | Vote cast |
+| `prop_exe` | `governance` | `(proposal_id,)` | Proposal executed |
+| `memb_add` | `governance` | `(member,)` | Member added |
+| `memb_rmv` | `governance` | `(member,)` | Member removed |
