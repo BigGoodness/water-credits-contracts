@@ -930,4 +930,127 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
     }
+
+    // ── Edge case tests ──
+
+    #[test]
+    fn test_zero_flow_produces_zero_volumetric_credit() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[40u8; 32]);
+        // flow_rate = 0 → no volumetric credits, no nutrient removal
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
+        let result = client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
+
+        assert!(result.is_some());
+        let res = result.unwrap();
+        assert_eq!(res.volumetric_credit, 0);
+        assert_eq!(res.n_removal_kg, 0);
+        assert_eq!(res.p_removal_kg, 0);
+        assert_eq!(res.total_credits, 0);
+    }
+
+    #[test]
+    fn test_single_oracle_submission_does_not_finalize() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[41u8; 32]);
+        let result = client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        // With min_oracles=3, one submission should not produce a result
+        assert!(result.is_none());
+        // And no last_result stored yet
+        assert!(client.get_last_result(&project_id).is_none());
+    }
+
+    #[test]
+    fn test_two_oracle_submissions_does_not_finalize() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[42u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let result = client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        assert!(result.is_none());
+        assert!(client.get_last_result(&project_id).is_none());
+    }
+
+    #[test]
+    fn test_all_zero_readings_no_credits_no_removal() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[43u8; 32]);
+        // Readings with high N and P (above baseline) and zero flow
+        // → no removal, no volumetric, only quality penalty from bad pH
+        client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
+        client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
+        let result = client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
+
+        assert!(result.is_some());
+        let res = result.unwrap();
+        assert_eq!(res.volumetric_credit, 0);
+        assert_eq!(res.n_removal_kg, 0);
+        assert_eq!(res.p_removal_kg, 0);
+        // total_credits is 0 (or negative capped to 0 after quality penalty on 0 gross)
+        assert_eq!(res.total_credits, 0);
+    }
+
+    #[test]
+    fn test_median_with_even_number_of_oracles_uses_lower_middle() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        // Change config to min_oracles=2 to test even-count median
+        let mut config = client.get_config();
+        config.min_oracles = 2;
+        client.update_config(&admin, &config);
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+
+        let project_id = BytesN::from_array(&e, &[44u8; 32]);
+        // flow: 400 and 600 → median = (400+600)/2 = 500
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &400, &250, &8, &1);
+        let result = client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &600, &250, &8, &1);
+
+        assert!(result.is_some());
+        let res = result.unwrap();
+        // volumetric = med_flow * 100 / 1000 = 500 * 100 / 1000 = 50
+        assert_eq!(res.volumetric_credit, 50);
+    }
 }
