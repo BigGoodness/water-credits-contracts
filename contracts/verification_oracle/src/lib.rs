@@ -517,6 +517,14 @@ fn submit_reading_impl(
             .unwrap_or(0)
     }
 
+    /// Get the current number of active whitelisted oracles.
+    pub fn oracle_count(e: Env) -> u32 {
+        e.storage()
+            .instance()
+            .get(&DataKey::OracleCount)
+            .unwrap_or(0)
+    }
+
     /// Update the oracle configuration (min/max oracles, quality thresholds, credit rates). Admin only.
     pub fn update_config(e: Env, admin: Address, config: OracleConfig) {
         admin.require_auth();
@@ -879,6 +887,27 @@ mod tests {
         assert_eq!(client.oracle_submit_count(&o1), 3);
         assert_eq!(client.oracle_submit_count(&o2), 1);
         assert_eq!(client.total_submissions(), 4);
+    }
+
+    #[test]
+    fn test_oracle_count_tracks_additions_and_removals() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        assert_eq!(client.oracle_count(), 0);
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        assert_eq!(client.oracle_count(), 1);
+
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        assert_eq!(client.oracle_count(), 3);
+
+        client.remove_oracle(&admin, &o2);
+        assert_eq!(client.oracle_count(), 2);
     }
 
     #[test]
