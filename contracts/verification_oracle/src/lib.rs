@@ -76,6 +76,7 @@ pub enum DataKey {
     WindowState(BytesN<32>),
     OracleSubmitted(BytesN<32>, Address),
     LastResult(BytesN<32>),
+    ResultHistory(BytesN<32>),
     ProjectConfig(BytesN<32>),
     OracleSubmitCount(Address),
     TotalSubmissions,
@@ -497,6 +498,17 @@ fn submit_reading_impl(
                 .instance()
                 .set(&DataKey::LastResult(project_id.clone()), &result);
 
+            // Append to historical results
+            let mut history: Vec<VerificationResult> = e
+                .storage()
+                .instance()
+                .get(&DataKey::ResultHistory(project_id.clone()))
+                .unwrap_or_else(|| Vec::new(&e));
+            history.push_back(result.clone());
+            e.storage()
+                .instance()
+                .set(&DataKey::ResultHistory(project_id.clone()), &history);
+
             window.finalized = true;
             e.storage()
                 .instance()
@@ -533,6 +545,14 @@ fn submit_reading_impl(
         e.storage()
             .instance()
             .get(&DataKey::LastResult(project_id))
+    }
+
+    /// Get the full history of verification results for a project.
+    pub fn get_result_history(e: Env, project_id: BytesN<32>) -> Vec<VerificationResult> {
+        e.storage()
+            .instance()
+            .get(&DataKey::ResultHistory(project_id))
+            .unwrap_or_else(|| Vec::new(&e))
     }
 
     /// Get the current oracle configuration parameters.
@@ -804,6 +824,42 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[5u8; 32]);
         let result = client.get_last_result(&project_id);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_result_history_accumulates_across_windows() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[50u8; 32]);
+
+        // First window
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        let history = client.get_result_history(&project_id);
+        assert_eq!(history.len(), 1);
+
+        // Reset window and submit again
+        client.reset_window(&admin, &project_id);
+        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+
+        let history = client.get_result_history(&project_id);
+        assert_eq!(history.len(), 2);
+
+        // Both should have valid oracle counts
+        assert_eq!(history.get(0).unwrap().oracle_count, 3);
+        assert_eq!(history.get(1).unwrap().oracle_count, 3);
     }
 
     #[test]
