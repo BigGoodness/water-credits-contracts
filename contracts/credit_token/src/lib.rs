@@ -57,6 +57,9 @@ pub enum DataKey {
     CertCount,
     Paused,
     MaxSupply,
+    /// An address that is allowed to call pause/unpause in addition to the admin.
+    /// Used to grant the governance contract emergency pause rights.
+    PauseGuardian,
 }
 
 fn is_paused(e: &Env) -> bool {
@@ -212,21 +215,25 @@ impl CreditToken {
             .set(&DataKey::RetirementRegistry, &registry);
     }
 
-    /// Pause all token operations (mint, transfer, retire). Admin only.
+    /// Pause all token operations (mint, transfer, retire). Admin or pause guardian only.
     /// Useful for emergency halts or project suspension.
-    pub fn pause(e: Env, admin: Address) {
-        admin.require_auth();
-        if admin != read_admin(&e) {
+    pub fn pause(e: Env, caller: Address) {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let guardian: Option<Address> = e.storage().instance().get(&DataKey::PauseGuardian);
+        if caller != admin && guardian.as_ref() != Some(&caller) {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Paused, &true);
         e.events().publish((EVENT_PAUSED,), ());
     }
 
-    /// Resume token operations after a pause. Admin only.
-    pub fn unpause(e: Env, admin: Address) {
-        admin.require_auth();
-        if admin != read_admin(&e) {
+    /// Resume token operations after a pause. Admin or pause guardian only.
+    pub fn unpause(e: Env, caller: Address) {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let guardian: Option<Address> = e.storage().instance().get(&DataKey::PauseGuardian);
+        if caller != admin && guardian.as_ref() != Some(&caller) {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Paused, &false);
@@ -258,6 +265,26 @@ impl CreditToken {
             .instance()
             .get(&DataKey::MaxSupply)
             .unwrap_or(0)
+    }
+
+    /// Set the pause guardian: a secondary address that may call `pause` and `unpause`
+    /// in addition to the admin. Intended for use by the governance contract so that
+    /// it can trigger an emergency pause without being the full token admin.
+    /// Pass the zero address (or call without a guardian) to clear the guardian.
+    /// Admin only.
+    pub fn set_pause_guardian(e: Env, admin: Address, guardian: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    /// Return the current pause guardian address, if any.
+    pub fn pause_guardian(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::PauseGuardian)
     }
 
     /// Mint new credits to a beneficiary. Callable by admin or designated minter.
