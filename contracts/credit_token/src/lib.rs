@@ -14,6 +14,8 @@ const EVENT_MINTED: Symbol = symbol_short!("minted");
 const EVENT_XFER: Symbol = symbol_short!("xfer");
 const EVENT_RETIRED: Symbol = symbol_short!("retired");
 const EVENT_BURNED: Symbol = symbol_short!("burned");
+const EVENT_PAUSED: Symbol = symbol_short!("paused");
+const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 
 // ── Data Types ──
 
@@ -218,6 +220,7 @@ impl CreditToken {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Paused, &true);
+        e.events().publish((EVENT_PAUSED,), ());
     }
 
     /// Resume token operations after a pause. Admin only.
@@ -227,6 +230,7 @@ impl CreditToken {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Paused, &false);
+        e.events().publish((EVENT_UNPAUSED,), ());
     }
 
     /// Returns true if the contract is currently paused.
@@ -1055,5 +1059,46 @@ mod tests {
         assert_eq!(client.balance(&user), 300);
         assert_eq!(client.total_supply(), 300);
         assert!(client.paused());
+    }
+
+    #[test]
+    fn test_pause_emits_event() {
+        let (e, admin, _, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.pause(&admin);
+
+        let events = e.events().all();
+        let mut found = false;
+        for i in 0..events.len() {
+            let (_contract, topics, _data) = &events.get(i).unwrap();
+            let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+            if topic == symbol_short!("paused") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn test_unpause_emits_event() {
+        let (e, admin, _, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let events = e.events().all();
+        let mut found = false;
+        for i in 0..events.len() {
+            let (_contract, topics, _data) = &events.get(i).unwrap();
+            let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+            if topic == symbol_short!("unpaused") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
     }
 }
