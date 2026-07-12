@@ -368,6 +368,8 @@ impl CreditToken {
         save_allowance(&e, &from, &spender, allowance - amount);
         save_balance(&e, &from, from_balance - amount);
         save_balance(&e, &to, to_balance.checked_add(amount).expect("overflow"));
+
+        e.events().publish((EVENT_XFER,), (from, to, amount));
     }
 
     /// Approve a spender to transfer up to `amount` credits.
@@ -629,6 +631,27 @@ mod tests {
         assert_eq!(client.balance(&owner), 800);
         assert_eq!(client.balance(&recipient), 200);
         assert_eq!(client.allowance(&owner, &spender), 300);
+    }
+
+    #[test]
+    fn test_transfer_from_emits_event() {
+        let (e, admin, owner, spender, _project_id, client) = setup();
+        let recipient = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &owner, &1000);
+        client.approve(&owner, &spender, &500, &100000);
+
+        // Clear events from mint + approve
+        client.transfer_from(&spender, &owner, &recipient, &200);
+
+        // transfer_from should emit an xfer event
+        // Count events: mint(1) + approve(0 events) + transfer_from(1) = 2
+        let events = e.events().all();
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, _data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("xfer"));
     }
 
     #[test]
