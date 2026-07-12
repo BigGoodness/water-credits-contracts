@@ -41,6 +41,7 @@ pub struct RetirementCertificate {
 pub enum DataKey {
     Balance(Address),
     Allowance(Address, Address),
+    AllowanceExpiration(Address, Address),
     Admin,
     Minter,
     RetirementRegistry,
@@ -363,6 +364,19 @@ impl CreditToken {
         if allowance < amount {
             panic!("insufficient allowance");
         }
+
+        // Check expiration
+        let expiration: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::AllowanceExpiration(from.clone(), spender.clone()))
+            .unwrap_or(0);
+        if expiration > 0 && e.ledger().sequence() >= expiration {
+            // Allowance has expired — reset and reject
+            save_allowance(&e, &from, &spender, 0);
+            panic!("allowance expired");
+        }
+
         let from_balance = read_balance(&e, &from);
         if from_balance < amount {
             panic!("insufficient balance");
@@ -376,12 +390,17 @@ impl CreditToken {
     }
 
     /// Approve a spender to transfer up to `amount` credits.
-    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, _expiration_ledger: u32) {
+    /// The allowance expires at the given ledger number. Use 0 for no expiration.
+    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
         if amount < 0 {
             panic!("amount must be non-negative");
         }
         from.require_auth();
         save_allowance(&e, &from, &spender, amount);
+        e.storage().instance().set(
+            &DataKey::AllowanceExpiration(from, spender),
+            &expiration_ledger,
+        );
     }
 
     /// Permanently retire credits and optionally record in the retirement registry.
@@ -672,6 +691,67 @@ mod tests {
         let (_contract, topics, _data) = &events.get(1).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("xfer"));
+    }
+
+    #[test]
+    fn test_approve_zero_expiration_never_expires() {
+        let (e, admin, owner, spender, _project_id, client) = setup();
+        let recipient = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &owner, &1000);
+        client.approve(&owner, &spender, &500, &0);
+
+        // Advance ledger far beyond any reasonable value — should still work
+        let mut info = e.ledger().get();
+        info.sequence = 999_999;
+        e.ledger().set(info);
+
+        client.transfer_from(&spender, &owner, &recipient, &100);
+        assert_eq!(client.balance(&recipient), 100);
+        assert_eq!(client.allowance(&owner, &spender), 400);
+    }
+
+    #[test]
+    fn test_allowance_expiration_blocks_transfer() {
+        let (e, admin, owner, spender, _project_id, client) = setup();
+        let recipient = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &owner, &1000);
+        client.approve(&owner, &spender, &500, &10);
+
+        // Advance to expiration ledger
+        let mut info = e.ledger().get();
+        info.sequence = 10;
+        e.ledger().set(info);
+
+        let result = std::panic::catch_unwind(|| {
+            client.transfer_from(&spender, &owner, &recipient, &100);
+        });
+        assert!(result.is_err());
+
+        // Allowance should be reset to 0
+        assert_eq!(client.allowance(&owner, &spender), 0);
+    }
+
+    #[test]
+    fn test_allowance_valid_before_expiration() {
+        let (e, admin, owner, spender, _project_id, client) = setup();
+        let recipient = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &owner, &1000);
+        client.approve(&owner, &spender, &500, &10);
+
+        // Advance to one ledger before expiration
+        let mut info = e.ledger().get();
+        info.sequence = 9;
+        e.ledger().set(info);
+
+        client.transfer_from(&spender, &owner, &recipient, &100);
+        assert_eq!(client.balance(&recipient), 100);
+        assert_eq!(client.allowance(&owner, &spender), 400);
     }
 
     #[test]
