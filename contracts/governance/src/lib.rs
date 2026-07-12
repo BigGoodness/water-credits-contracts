@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, String, Symbol, Val,
+    Vec,
 };
 
 #[cfg(test)]
@@ -11,6 +12,8 @@ const EVENT_PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exe");
 const EVENT_VOTE_CAST: Symbol = symbol_short!("vote_cst");
 const EVENT_MEMBER_ADDED: Symbol = symbol_short!("memb_add");
 const EVENT_MEMBER_REMOVED: Symbol = symbol_short!("memb_rmv");
+const EVENT_EMERGENCY_PAUSE: Symbol = symbol_short!("emrg_pse");
+const EVENT_EMERGENCY_UNPAUSE: Symbol = symbol_short!("emrg_ups");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +61,18 @@ pub struct GovernanceAction {
     pub args: Vec<Symbol>,
 }
 
+/// Built-in protocol action types. These are dispatched by `execute` and
+/// `emergency_pause`/`emergency_unpause` without requiring a generic
+/// cross-contract call encoding.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProtocolAction {
+    /// Pause all registered credit token contracts.
+    EmergencyPause,
+    /// Unpause all registered credit token contracts.
+    EmergencyUnpause,
+}
+
 #[contracttype]
 pub struct VoteCounts {
     pub yes: u32,
@@ -74,6 +89,10 @@ pub enum DataKey {
     Proposal(u64),
     HasVoted(u64, Address),
     ActiveProposals,
+    /// Whether the protocol is currently in emergency-pause state.
+    ProtocolPaused,
+    /// The list of credit token contract addresses to pause/unpause.
+    RegisteredTokens,
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -136,6 +155,12 @@ impl Governance {
             }
         }
         e.storage().instance().set(&DataKey::MemberCount, &count);
+        e.storage()
+            .instance()
+            .set(&DataKey::ProtocolPaused, &false);
+        e.storage()
+            .instance()
+            .set(&DataKey::RegisteredTokens, &Vec::<Address>::new(&e));
     }
 
     /// Get the current governance configuration (fee, voting period, thresholds).
@@ -337,6 +362,21 @@ impl Governance {
             .instance()
             .set(&DataKey::ActiveProposals, &new_active);
 
+        // Dispatch proposal actions.
+        // Built-in protocol actions are identified by the `function` field:
+        //   "emergency_pause"   → pause all registered token contracts
+        //   "emergency_unpause" → unpause all registered token contracts
+        // All other function names are currently recorded for off-chain handling.
+        for i in 0..proposal.actions.len() {
+            let action = proposal.actions.get(i).unwrap();
+            if action.function == String::from_str(&e, "emergency_pause") {
+                Self::do_pause(&e);
+            } else if action.function == String::from_str(&e, "emergency_unpause") {
+                Self::do_unpause(&e);
+            }
+            // Additional action types can be added here in future versions.
+        }
+
         e.events()
             .publish((EVENT_PROPOSAL_EXECUTED,), (proposal_id,));
     }
@@ -420,6 +460,144 @@ impl Governance {
     /// Get the total number of governance members.
     pub fn member_count_fn(e: Env) -> u32 {
         member_count(&e)
+    }
+
+    // ── Token Registry ──
+
+    /// Register a credit token contract address so it can be paused/unpaused
+    /// by governance during an emergency. Admin only.
+    pub fn register_token(e: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let mut tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(&e));
+        // Idempotent: only add if not already present.
+        for i in 0..tokens.len() {
+            if tokens.get(i).unwrap() == token {
+                return;
+            }
+        }
+        tokens.push_back(token);
+        e.storage()
+            .instance()
+            .set(&DataKey::RegisteredTokens, &tokens);
+    }
+
+    /// Remove a credit token contract from the governance registry. Admin only.
+    pub fn deregister_token(e: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(&e));
+        let mut filtered: Vec<Address> = Vec::new(&e);
+        for i in 0..tokens.len() {
+            let addr = tokens.get(i).unwrap();
+            if addr != token {
+                filtered.push_back(addr);
+            }
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::RegisteredTokens, &filtered);
+    }
+
+    /// Return the list of all registered credit token contract addresses.
+    pub fn list_registered_tokens(e: Env) -> Vec<Address> {
+        e.storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(&e))
+    }
+
+    // ── Emergency Pause ──
+
+    /// Returns true when the protocol is in emergency-pause state.
+    pub fn is_protocol_paused(e: Env) -> bool {
+        e.storage()
+            .instance()
+            .get(&DataKey::ProtocolPaused)
+            .unwrap_or(false)
+    }
+
+    /// Emergency pause: immediately calls `pause(governance_contract)` on every
+    /// registered credit token contract, then records the paused state.
+    ///
+    /// Authorization: admin only.
+    /// For a governance-proposal-triggered pause use `emergency_pause_via_proposal`.
+    pub fn emergency_pause(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        Self::do_pause(&e);
+    }
+
+    /// Emergency unpause: calls `unpause(governance_contract)` on every registered
+    /// credit token contract and clears the paused state.
+    ///
+    /// Authorization: admin only.
+    pub fn emergency_unpause(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        Self::do_unpause(&e);
+    }
+
+    // ── Internal helpers ──
+
+    fn do_pause(e: &Env) {
+        let tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(e));
+
+        let gov_addr = e.current_contract_address();
+        for i in 0..tokens.len() {
+            let token = tokens.get(i).unwrap();
+            let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
+            e.invoke_contract::<()>(&token, &Symbol::new(e, "pause"), args);
+        }
+
+        e.storage()
+            .instance()
+            .set(&DataKey::ProtocolPaused, &true);
+        e.events().publish((EVENT_EMERGENCY_PAUSE,), ());
+    }
+
+    fn do_unpause(e: &Env) {
+        let tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(e));
+
+        let gov_addr = e.current_contract_address();
+        for i in 0..tokens.len() {
+            let token = tokens.get(i).unwrap();
+            let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
+            e.invoke_contract::<()>(&token, &Symbol::new(e, "unpause"), args);
+        }
+
+        e.storage()
+            .instance()
+            .set(&DataKey::ProtocolPaused, &false);
+        e.events().publish((EVENT_EMERGENCY_UNPAUSE,), ());
     }
 }
 
@@ -717,6 +895,62 @@ mod tests {
 
         let proposal = client.get_proposal(&id).unwrap();
         assert!(proposal.voting_ends_at < e.ledger().timestamp());
+    }
+
+    // ── Token registry tests ──
+
+    #[test]
+    fn test_register_and_list_tokens() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        // Generate fake token addresses (no real contract needed for registry tests).
+        let token_a = Address::generate(&e);
+        let token_b = Address::generate(&e);
+
+        assert_eq!(client.list_registered_tokens().len(), 0);
+
+        client.register_token(&admin, &token_a);
+        assert_eq!(client.list_registered_tokens().len(), 1);
+
+        client.register_token(&admin, &token_b);
+        assert_eq!(client.list_registered_tokens().len(), 2);
+    }
+
+    #[test]
+    fn test_register_token_idempotent() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let token = Address::generate(&e);
+        client.register_token(&admin, &token);
+        client.register_token(&admin, &token);
+        client.register_token(&admin, &token);
+
+        assert_eq!(client.list_registered_tokens().len(), 1);
+    }
+
+    #[test]
+    fn test_deregister_token() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let token_a = Address::generate(&e);
+        let token_b = Address::generate(&e);
+        client.register_token(&admin, &token_a);
+        client.register_token(&admin, &token_b);
+
+        client.deregister_token(&admin, &token_a);
+
+        let remaining = client.list_registered_tokens();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap(), token_b);
+    }
+
+    #[test]
+    fn test_is_protocol_paused_initial_state() {
+        let (_e, _admin, _member, client) = setup();
+        assert!(!client.is_protocol_paused());
     }
 
 }
