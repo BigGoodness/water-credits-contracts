@@ -352,6 +352,44 @@ impl CreditToken {
         e.events().publish((EVENT_XFER,), (from, to, amount));
     }
 
+    /// Transfer credits from one holder to multiple recipients in a single call.
+    /// The sender's balance is debited the total of all amounts atomically.
+    /// Each recipient receives the corresponding amount.
+    pub fn batch_transfer(e: Env, from: Address, recipients: Vec<Address>, amounts: Vec<i128>) {
+        if recipients.len() != amounts.len() {
+            panic!("recipients and amounts length mismatch");
+        }
+        if recipients.len() == 0 {
+            panic!("empty batch");
+        }
+        require_not_paused(&e);
+        from.require_auth();
+
+        // Calculate total amount to deduct from sender
+        let mut total_amount: i128 = 0;
+        for i in 0..amounts.len() {
+            let amount = amounts.get(i).unwrap();
+            if amount <= 0 {
+                panic!("amount must be positive");
+            }
+            total_amount = total_amount.checked_add(amount).expect("overflow");
+        }
+
+        let from_balance = read_balance(&e, &from);
+        if from_balance < total_amount {
+            panic!("insufficient balance");
+        }
+        save_balance(&e, &from, from_balance - total_amount);
+
+        for i in 0..recipients.len() {
+            let to = recipients.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            let to_balance = read_balance(&e, &to);
+            save_balance(&e, &to, to_balance.checked_add(amount).expect("overflow"));
+            e.events().publish((EVENT_XFER,), (from.clone(), to, amount));
+        }
+    }
+
     /// Transfer credits on behalf of an approved holder.
     pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
         if amount <= 0 {
@@ -925,6 +963,41 @@ mod tests {
         client.batch_mint_to(&admin, &recipients, &amounts);
         assert_eq!(client.balance(&user), 400);
         assert_eq!(client.total_supply(), 400);
+    }
+
+    #[test]
+    fn test_batch_transfer_distributes_correctly() {
+        let (e, admin, user1, user2, _project_id, client) = setup();
+        let user3 = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user1, &1000);
+
+        let recipients = Vec::from_array(&e, [user2.clone(), user3.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [200i128, 300i128]);
+        client.batch_transfer(&user1, &recipients, &amounts);
+
+        assert_eq!(client.balance(&user1), 500);
+        assert_eq!(client.balance(&user2), 200);
+        assert_eq!(client.balance(&user3), 300);
+        assert_eq!(client.total_supply(), 1000);
+    }
+
+    #[test]
+    fn test_batch_transfer_insufficient_balance() {
+        let (e, admin, user1, user2, _project_id, client) = setup();
+        let user3 = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user1, &100);
+
+        let recipients = Vec::from_array(&e, [user2.clone(), user3.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [60i128, 60i128]);
+
+        let result = std::panic::catch_unwind(|| {
+            client.batch_transfer(&user1, &recipients, &amounts);
+        });
+        assert!(result.is_err());
     }
 
     #[test]
