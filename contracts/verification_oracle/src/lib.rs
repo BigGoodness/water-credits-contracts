@@ -70,6 +70,7 @@ pub enum DataKey {
     Admin,
     OracleActive(Address),
     OracleCount,
+    OracleList,
     Config,
     OracleNonce(Address),
     WindowState(BytesN<32>),
@@ -154,6 +155,9 @@ impl VerificationOracle {
         }
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.storage().instance().set(&DataKey::OracleCount, &0u32);
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleList, &Vec::<Address>::new(&e));
 
         let config = OracleConfig {
             min_oracles: 3,
@@ -189,6 +193,16 @@ impl VerificationOracle {
         e.storage()
             .instance()
             .set(&DataKey::OracleCount, &(count + 1));
+
+        let mut list: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleList)
+            .unwrap();
+        list.push_back(oracle);
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleList, &list);
     }
 
     /// Remove an oracle from the whitelist. Must maintain at least min_oracles.
@@ -211,10 +225,27 @@ impl VerificationOracle {
         }
         e.storage()
             .instance()
-            .remove(&DataKey::OracleActive(oracle));
+            .remove(&DataKey::OracleActive(oracle.clone()));
         e.storage()
             .instance()
             .set(&DataKey::OracleCount, &(count - 1));
+
+        // Filter the oracle out of the list
+        let list: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleList)
+            .unwrap();
+        let mut filtered: Vec<Address> = Vec::new(&e);
+        for i in 0..list.len() {
+            let addr = list.get(i).unwrap();
+            if addr != oracle {
+                filtered.push_back(addr);
+            }
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::OracleList, &filtered);
     }
 
     /// Check if an oracle address is whitelisted and active.
@@ -223,6 +254,14 @@ impl VerificationOracle {
             .instance()
             .get(&DataKey::OracleActive(oracle))
             .unwrap_or(false)
+    }
+
+    /// Get the list of all currently active oracle addresses.
+    pub fn get_oracles(e: Env) -> Vec<Address> {
+        e.storage()
+            .instance()
+            .get(&DataKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&e))
     }
 
     /// Submit a sensor reading for a project. Uses nonce-based replay protection.
@@ -908,6 +947,35 @@ mod tests {
 
         client.remove_oracle(&admin, &o2);
         assert_eq!(client.oracle_count(), 2);
+    }
+
+    #[test]
+    fn test_get_oracles_returns_active_list() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = client.get_oracles();
+        assert_eq!(oracles.len(), 0);
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let oracles = client.get_oracles();
+        assert_eq!(oracles.len(), 3);
+        assert!(oracles.contains(&o1));
+        assert!(oracles.contains(&o2));
+        assert!(oracles.contains(&o3));
+
+        client.remove_oracle(&admin, &o2);
+        let oracles = client.get_oracles();
+        assert_eq!(oracles.len(), 2);
+        assert!(oracles.contains(&o1));
+        assert!(!oracles.contains(&o2));
+        assert!(oracles.contains(&o3));
     }
 
     #[test]
