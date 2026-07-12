@@ -351,6 +351,16 @@ impl Governance {
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
+    /// Transfer admin rights to a new address. Admin only.
+    pub fn transfer_admin(e: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     /// Add a new governance member. Admin only.
     pub fn add_member(e: Env, admin: Address, new_member: Address) {
         admin.require_auth();
@@ -649,6 +659,41 @@ mod tests {
         let config = client.get_config();
         assert_eq!(config.fee_bps, 100);
         assert_eq!(config.max_active_proposals, 20);
+    }
+
+    #[test]
+    fn test_transfer_admin() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let new_admin = Address::generate(&e);
+        client.transfer_admin(&admin, &new_admin);
+
+        // New admin can now perform admin actions
+        let config = GovernanceConfig {
+            fee_bps: 200,
+            voting_period: 604800,
+            timelock_duration: 86400,
+            approval_threshold_bps: 6000,
+            min_proposal_deposit: 1000,
+            max_active_proposals: 10,
+        };
+        client.update_config(&new_admin, &config);
+        assert_eq!(client.get_config().fee_bps, 200);
+
+        // Old admin should be rejected
+        let result = std::panic::catch_unwind(|| {
+            let config2 = GovernanceConfig {
+                fee_bps: 300,
+                voting_period: 604800,
+                timelock_duration: 86400,
+                approval_threshold_bps: 6000,
+                min_proposal_deposit: 1000,
+                max_active_proposals: 10,
+            };
+            client.update_config(&admin, &config2);
+        });
+        assert!(result.is_err());
     }
 
     #[test]
