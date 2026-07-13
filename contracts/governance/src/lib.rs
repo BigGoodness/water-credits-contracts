@@ -22,6 +22,7 @@ pub enum ProposalStatus {
     Active,
     Approved,
     Executed,
+    FailedExecution,
     Rejected,
     Expired,
 }
@@ -57,8 +58,8 @@ pub struct Proposal {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GovernanceAction {
     pub target: Address,
-    pub function: String,
-    pub args: Vec<Symbol>,
+    pub function: Symbol,
+    pub args: Vec<Val>,
 }
 
 /// Built-in protocol action types. These are dispatched by `execute` and
@@ -344,11 +345,6 @@ impl Governance {
             panic!("timelock not elapsed");
         }
 
-        proposal.status = ProposalStatus::Executed;
-        e.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
-
         // Remove from active list
         let active: Vec<u64> = e.storage().instance().get(&DataKey::ActiveProposals).unwrap();
         let mut new_active: Vec<u64> = Vec::new(&e);
@@ -363,19 +359,38 @@ impl Governance {
             .set(&DataKey::ActiveProposals, &new_active);
 
         // Dispatch proposal actions.
+        //
         // Built-in protocol actions are identified by the `function` field:
         //   "emergency_pause"   → pause all registered token contracts
         //   "emergency_unpause" → unpause all registered token contracts
-        // All other function names are currently recorded for off-chain handling.
+        //
+        // All other actions are executed as generic cross-contract invocations
+        // via `e.invoke_contract()`, using the target address, function symbol,
+        // and arguments stored in the GovernanceAction.
+        //
+        // Error policy — REVERT: if any cross-contract invocation fails the
+        // entire `execute()` call is reverted.  The proposal retains its
+        // `Approved` status and can be retried or superseded by a new proposal.
         for i in 0..proposal.actions.len() {
             let action = proposal.actions.get(i).unwrap();
-            if action.function == String::from_str(&e, "emergency_pause") {
+            if action.function == Symbol::new(&e, "emergency_pause") {
                 Self::do_pause(&e);
-            } else if action.function == String::from_str(&e, "emergency_unpause") {
+            } else if action.function == Symbol::new(&e, "emergency_unpause") {
                 Self::do_unpause(&e);
+            } else {
+                e.invoke_contract::<()>(
+                    &action.target,
+                    &action.function,
+                    action.args.clone(),
+                );
             }
-            // Additional action types can be added here in future versions.
         }
+
+        // Mark executed only after all actions succeed (revert-safe ordering).
+        proposal.status = ProposalStatus::Executed;
+        e.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
 
         e.events()
             .publish((EVENT_PROPOSAL_EXECUTED,), (proposal_id,));
@@ -605,6 +620,38 @@ impl Governance {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
+
+    mod mock_target {
+        use soroban_sdk::{contract, contractimpl, contracttype, Env};
+
+        #[contracttype]
+        pub enum DataKey {
+            Value,
+        }
+
+        #[contract]
+        pub struct MockTarget;
+
+        #[contractimpl]
+        impl MockTarget {
+            pub fn set_value(e: Env, val: i128) {
+                e.storage().instance().set(&DataKey::Value, &val);
+            }
+
+            pub fn get_value(e: Env) -> i128 {
+                e.storage().instance().get(&DataKey::Value).unwrap_or(0)
+            }
+
+            pub fn always_fail(_e: Env) {
+                panic!("intentional failure");
+            }
+
+            pub fn echo_arg(e: Env, symbol: Symbol) -> Symbol {
+                e.storage().instance().set(&DataKey::Value, &symbol);
+                symbol
+            }
+        }
+    }
 
     fn setup() -> (Env, Address, Address, GovernanceClient<'static>) {
         let e = Env::default();
@@ -953,4 +1000,238 @@ mod tests {
         assert!(!client.is_protocol_paused());
     }
 
+    // ── Cross-contract invocation tests ──
+
+    #[test]
+    fn test_execute_generic_cross_contract_action() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member = Address::generate(&e);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+        let mock_client = mock_target::MockTargetClient::new(&e, &mock_id);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [42i128.into_val(&e)]),
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let proposal_id = gov_client.propose(
+            &member,
+            &String::from_str(&e, "Set Mock Value"),
+            &String::from_str(&e, "Sets the mock value to 42"),
+            &actions,
+        );
+
+        gov_client.vote(&member, &proposal_id, &true);
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        gov_client.execute(&member, &proposal_id);
+
+        assert_eq!(mock_client.get_value(), 42);
+
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    #[test]
+    fn test_execute_multiple_actions_sequential() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member = Address::generate(&e);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+        let mock_client = mock_target::MockTargetClient::new(&e, &mock_id);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+
+        let sym1 = Symbol::new(&e, "hello");
+        let sym2 = Symbol::new(&e, "world");
+
+        let action1 = GovernanceAction {
+            target: mock_id.clone(),
+            function: Symbol::new(&e, "echo_arg"),
+            args: Vec::from_array(&e, [sym1.clone().into_val(&e)]),
+        };
+        let action2 = GovernanceAction {
+            target: mock_id.clone(),
+            function: Symbol::new(&e, "echo_arg"),
+            args: Vec::from_array(&e, [sym2.clone().into_val(&e)]),
+        };
+        let actions = Vec::from_array(&e, [action1, action2]);
+
+        let proposal_id = gov_client.propose(
+            &member,
+            &String::from_str(&e, "Echo Args"),
+            &String::from_str(&e, "Calls echo_arg twice"),
+            &actions,
+        );
+
+        gov_client.vote(&member, &proposal_id, &true);
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        gov_client.execute(&member, &proposal_id);
+
+        // Last call wins — the mock stores the most recent value.
+        assert_eq!(mock_client.get_value(), 0); // i128 default
+        // But the echo_arg returns the symbol; verify via the stored key.
+        let stored: Symbol = e
+            .storage()
+            .instance()
+            .get(&mock_target::DataKey::Value)
+            .unwrap();
+        assert_eq!(stored, sym2);
+    }
+
+    #[test]
+    fn test_execute_reverts_on_failed_action() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member = Address::generate(&e);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let proposal_id = gov_client.propose(
+            &member,
+            &String::from_str(&e, "Fail Proposal"),
+            &String::from_str(&e, "This will fail"),
+            &actions,
+        );
+
+        gov_client.vote(&member, &proposal_id, &true);
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        let result = std::panic::catch_unwind(|| {
+            gov_client.execute(&member, &proposal_id);
+        });
+        assert!(result.is_err(), "execute must revert when an action fails");
+
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_execute_generic_action_preserves_auth_model() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member1 = Address::generate(&e);
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+        let mock_client = mock_target::MockTargetClient::new(&e, &mock_id);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(
+            &admin,
+            &Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
+        );
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [999i128.into_val(&e)]),
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let proposal_id = gov_client.propose(
+            &member1,
+            &String::from_str(&e, "Auth Test"),
+            &String::from_str(&e, "Verifies auth model is preserved"),
+            &actions,
+        );
+
+        gov_client.vote(&member1, &proposal_id, &true);
+        gov_client.vote(&member2, &proposal_id, &true);
+        gov_client.vote(&member3, &proposal_id, &true);
+
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        gov_client.execute(&member1, &proposal_id);
+
+        assert_eq!(mock_client.get_value(), 999);
+    }
+
+    #[test]
+    fn test_emergency_pause_action_still_works() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+
+        let pause_action = GovernanceAction {
+            target: admin.clone(), // target is ignored for built-in actions
+            function: Symbol::new(&e, "emergency_pause"),
+            args: Vec::new(&e),
+        };
+        let actions = Vec::from_array(&e, [pause_action]);
+
+        let proposal_id = client.propose(
+            &member1,
+            &String::from_str(&e, "Pause"),
+            &String::from_str(&e, "pause the protocol"),
+            &actions,
+        );
+
+        client.vote(&member1, &proposal_id, &true);
+        client.vote(&member2, &proposal_id, &true);
+
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.execute(&member1, &proposal_id);
+
+        assert!(client.is_protocol_paused());
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
 }

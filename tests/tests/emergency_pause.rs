@@ -9,7 +9,7 @@ use credit_token::{CreditToken, CreditTokenClient};
 use governance::{Governance, GovernanceAction, GovernanceClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env, String, Vec,
+    Address, BytesN, Env, String, Symbol, Vec,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ fn test_supermajority_proposal_emergency_pause() {
     // Build a proposal whose single action is the built-in emergency_pause.
     let pause_action = GovernanceAction {
         target: gov_id.clone(), // target is ignored for built-in actions
-        function: String::from_str(&e, "emergency_pause"),
+        function: Symbol::new(&e, "emergency_pause"),
         args: Vec::new(&e),
     };
     let actions = Vec::from_array(&e, [pause_action]);
@@ -186,7 +186,7 @@ fn test_supermajority_proposal_emergency_unpause() {
     // Propose to unpause.
     let unpause_action = GovernanceAction {
         target: gov_id.clone(),
-        function: String::from_str(&e, "emergency_unpause"),
+        function: Symbol::new(&e, "emergency_unpause"),
         args: Vec::new(&e),
     };
     let actions = Vec::from_array(&e, [unpause_action]);
