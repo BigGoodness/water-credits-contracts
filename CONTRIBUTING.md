@@ -11,6 +11,7 @@ Thank you for your interest in contributing! This document covers the setup, wor
 - [Coding Standards](#coding-standards)
 - [Testing](#testing)
 - [Pull Request Process](#pull-request-process)
+- [Changelog](#changelog)
 - [Issue Reporting](#issue-reporting)
 - [Security](#security)
 
@@ -144,6 +145,15 @@ Before submitting a PR, ensure:
 - [ ] Documentation updated (if needed)
 - [ ] CHANGELOG entry added (if applicable)
 - [ ] No breaking changes without discussion
+
+## Changelog
+
+This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. When submitting a PR that warrants a changelog entry:
+
+1. Add your change under the `[Unreleased]` section in [CHANGELOG.md](CHANGELOG.md).
+2. Use the appropriate category: **Added**, **Changed**, **Fixed**, **Removed**, **Deprecated**, or **Security**.
+3. Keep entries concise and focused on user-facing impact.
+4. Reference contract or module names in backticks for clarity (e.g., `credit_token`, `governance`).
 
 ## Issue Reporting
 
