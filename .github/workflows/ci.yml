@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0       # Disable incremental compilation in CI (faster cold builds, avoids stale artifacts)
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Format check
+  # ─────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ─────────────────────────────────────────────
+  # Job 2: Clippy lint
+  # ─────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+
+      # Lint the host-native targets (contracts + tests workspace).
+      # The testutils feature enables the test-only SDK surface that
+      # clippy needs to analyse the integration test crate.
+      - name: cargo clippy
+        run: |
+          cargo clippy --workspace --exclude tests -- -D warnings
+          cargo clippy -p tests --features testutils -- -D warnings
+
+  # ─────────────────────────────────────────────
+  # Job 3: Unit & integration tests
+  # ─────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      # Run tests via the test crate which depends on all contracts
+      # with the testutils feature enabled. The Soroban SDK test
+      # environment runs entirely in native (x86) code — no WASM
+      # execution or Soroban CLI required at test time.
+      - name: cargo test
+        run: cargo test -p tests --features testutils -- --nocapture
+
+  # ─────────────────────────────────────────────
+  # Job 4: WASM build (ensures contracts compile
+  #         to the wasm32 target without errors)
+  # ─────────────────────────────────────────────
+  build-wasm:
+    name: Build (WASM)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        contract:
+          - credit_token
+          - credit_factory
+          - verification_oracle
+          - retirement_registry
+          - project_registry
+          - governance
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ matrix.contract }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-${{ matrix.contract }}-
+
+      - name: Build ${{ matrix.contract }}
+        run: >
+          cargo build
+          --target wasm32-unknown-unknown
+          --release
+          -p ${{ matrix.contract }}
+
+      - name: Verify WASM artifact exists
+        run: |
+          ls -lh target/wasm32-unknown-unknown/release/${{ matrix.contract }}.wasm
