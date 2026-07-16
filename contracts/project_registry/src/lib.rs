@@ -6,6 +6,14 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, St
 #[cfg(test)]
 extern crate std;
 
+// ── TTL constants ──
+/// Projects are permanent registrations: 10 years.
+const PROJECT_TTL_THRESHOLD: u32 = 63_072_000;
+const PROJECT_TTL_BUMP: u32 = 63_072_000;
+/// Index entries match project lifetime.
+const INDEX_TTL_THRESHOLD: u32 = 63_072_000;
+const INDEX_TTL_BUMP: u32 = 63_072_000;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectEntry {
@@ -20,12 +28,22 @@ pub struct ProjectEntry {
     pub registered_at: u64,
 }
 
+/// Storage key enum.
+///
+/// Instance:   Admin, ProjectCount
+/// Persistent: Project(BytesN<32>), ProjectIdAt(u64)
+///
+/// The old ProjectIds Vec<BytesN<32>> is replaced by a compound-key index:
+///   ProjectIdAt(position: u64) → BytesN<32>
+/// Iteration: for pos in 0..ProjectCount { get ProjectIdAt(pos) }
 #[contracttype]
 pub enum DataKey {
+    // ── Instance ──
     Admin,
     ProjectCount,
+    // ── Persistent ──
     Project(BytesN<32>),
-    ProjectIds,
+    ProjectIdAt(u64),
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -49,9 +67,6 @@ impl ProjectRegistry {
         }
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.storage().instance().set(&DataKey::ProjectCount, &0u64);
-        e.storage()
-            .instance()
-            .set(&DataKey::ProjectIds, &Vec::<BytesN<32>>::new(&e));
     }
 
     /// Register a new project. Admin only. Returns the unique project ID.
@@ -95,13 +110,20 @@ impl ProjectRegistry {
             registered_at: timestamp,
         };
 
+        // Store project entry in persistent storage
+        let proj_key = DataKey::Project(project_id.clone());
+        e.storage().persistent().set(&proj_key, &project);
         e.storage()
-            .instance()
-            .set(&DataKey::Project(project_id.clone()), &project);
+            .persistent()
+            .extend_ttl(&proj_key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
 
-        let mut ids: Vec<BytesN<32>> = e.storage().instance().get(&DataKey::ProjectIds).unwrap();
-        ids.push_back(project_id.clone());
-        e.storage().instance().set(&DataKey::ProjectIds, &ids);
+        // Append to positional index
+        let idx_key = DataKey::ProjectIdAt(count);
+        e.storage().persistent().set(&idx_key, &project_id);
+        e.storage()
+            .persistent()
+            .extend_ttl(&idx_key, INDEX_TTL_THRESHOLD, INDEX_TTL_BUMP);
+
         e.storage()
             .instance()
             .set(&DataKey::ProjectCount, &(count + 1));
@@ -111,7 +133,14 @@ impl ProjectRegistry {
 
     /// Get a project entry by its ID. Returns None if not found.
     pub fn get(e: Env, project_id: BytesN<32>) -> Option<ProjectEntry> {
-        e.storage().instance().get(&DataKey::Project(project_id))
+        let key = DataKey::Project(project_id);
+        let result: Option<ProjectEntry> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
+        }
+        result
     }
 
     /// Update a project's status. Valid statuses: registered, active, completed, suspended. Admin only.
@@ -122,10 +151,11 @@ impl ProjectRegistry {
             panic!("unauthorized");
         }
 
+        let key = DataKey::Project(project_id.clone());
         let mut project: ProjectEntry = e
             .storage()
-            .instance()
-            .get(&DataKey::Project(project_id.clone()))
+            .persistent()
+            .get(&key)
             .unwrap_or_else(|| panic!("project not found"));
 
         let valid = status == String::from_str(&e, "registered")
@@ -137,9 +167,10 @@ impl ProjectRegistry {
         }
 
         project.status = status;
+        e.storage().persistent().set(&key, &project);
         e.storage()
-            .instance()
-            .set(&DataKey::Project(project_id), &project);
+            .persistent()
+            .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
     }
 
     /// Get the total number of registered projects.
@@ -147,14 +178,46 @@ impl ProjectRegistry {
         e.storage().instance().get(&DataKey::ProjectCount).unwrap()
     }
 
-    /// List all registered projects. Returns an empty vec if none exist.
+    /// List registered projects with pagination.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
     pub fn list_all(e: Env) -> Vec<ProjectEntry> {
-        let ids: Vec<BytesN<32>> = e.storage().instance().get(&DataKey::ProjectIds).unwrap();
+        let total: u64 = e.storage().instance().get(&DataKey::ProjectCount).unwrap();
         let mut projects: Vec<ProjectEntry> = Vec::new(&e);
-        for i in 0..ids.len() {
-            let id = ids.get(i).unwrap();
-            if let Some(project) = e.storage().instance().get(&DataKey::Project(id)) {
-                projects.push_back(project);
+        for pos in 0..total {
+            let idx_key = DataKey::ProjectIdAt(pos);
+            if let Some(id) = e.storage().persistent().get::<_, BytesN<32>>(&idx_key) {
+                let proj_key = DataKey::Project(id);
+                if let Some(project) = e.storage().persistent().get::<_, ProjectEntry>(&proj_key) {
+                    e.storage().persistent().extend_ttl(
+                        &proj_key,
+                        PROJECT_TTL_THRESHOLD,
+                        PROJECT_TTL_BUMP,
+                    );
+                    projects.push_back(project);
+                }
+            }
+        }
+        projects
+    }
+
+    /// List registered projects with pagination.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    pub fn list_paginated(e: Env, offset: u64, limit: u32) -> Vec<ProjectEntry> {
+        let total: u64 = e.storage().instance().get(&DataKey::ProjectCount).unwrap();
+        let end = (offset + limit as u64).min(total);
+        let mut projects: Vec<ProjectEntry> = Vec::new(&e);
+        for pos in offset..end {
+            let idx_key = DataKey::ProjectIdAt(pos);
+            if let Some(id) = e.storage().persistent().get::<_, BytesN<32>>(&idx_key) {
+                let proj_key = DataKey::Project(id);
+                if let Some(project) = e.storage().persistent().get::<_, ProjectEntry>(&proj_key) {
+                    e.storage().persistent().extend_ttl(
+                        &proj_key,
+                        PROJECT_TTL_THRESHOLD,
+                        PROJECT_TTL_BUMP,
+                    );
+                    projects.push_back(project);
+                }
             }
         }
         projects
@@ -165,10 +228,11 @@ impl ProjectRegistry {
     pub fn update_owner(e: Env, caller: Address, project_id: BytesN<32>, new_owner: Address) {
         caller.require_auth();
         let admin = read_admin(&e);
+        let key = DataKey::Project(project_id.clone());
         let mut project: ProjectEntry = e
             .storage()
-            .instance()
-            .get(&DataKey::Project(project_id.clone()))
+            .persistent()
+            .get(&key)
             .unwrap_or_else(|| panic!("project not found"));
 
         if caller != admin && caller != project.owner {
@@ -176,9 +240,10 @@ impl ProjectRegistry {
         }
 
         project.owner = new_owner;
+        e.storage().persistent().set(&key, &project);
         e.storage()
-            .instance()
-            .set(&DataKey::Project(project_id), &project);
+            .persistent()
+            .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
     }
 }
 
