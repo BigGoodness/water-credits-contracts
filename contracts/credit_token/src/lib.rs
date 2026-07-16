@@ -6,6 +6,17 @@ use soroban_sdk::{
 
 use soroban_sdk::IntoVal;
 
+// ── TTL constants (in ledgers; ~5 sec/ledger on Stellar) ──
+/// 1 year ≈ 6 307 200 ledgers. Used for balance, allowance, and cert entries.
+const BALANCE_TTL_THRESHOLD: u32 = 6_307_200;
+const BALANCE_TTL_BUMP: u32 = 6_307_200;
+/// Allowances are shorter-lived: 90 days.
+const ALLOWANCE_TTL_THRESHOLD: u32 = 1_555_200;
+const ALLOWANCE_TTL_BUMP: u32 = 1_555_200;
+/// Certificates are permanent records: 10 years.
+const CERT_TTL_THRESHOLD: u32 = 63_072_000;
+const CERT_TTL_BUMP: u32 = 63_072_000;
+
 #[cfg(test)]
 extern crate std;
 
@@ -100,16 +111,22 @@ fn require_minter(e: &Env, caller: &Address) {
 }
 
 fn read_balance(e: &Env, addr: &Address) -> i128 {
-    e.storage()
-        .instance()
-        .get(&DataKey::Balance(addr.clone()))
-        .unwrap_or(0)
+    let key = DataKey::Balance(addr.clone());
+    let val: i128 = e.storage().persistent().get(&key).unwrap_or(0);
+    if val > 0 {
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, BALANCE_TTL_THRESHOLD, BALANCE_TTL_BUMP);
+    }
+    val
 }
 
 fn save_balance(e: &Env, addr: &Address, amount: i128) {
+    let key = DataKey::Balance(addr.clone());
+    e.storage().persistent().set(&key, &amount);
     e.storage()
-        .instance()
-        .set(&DataKey::Balance(addr.clone()), &amount);
+        .persistent()
+        .extend_ttl(&key, BALANCE_TTL_THRESHOLD, BALANCE_TTL_BUMP);
 }
 
 fn read_total_supply(e: &Env) -> i128 {
@@ -129,16 +146,22 @@ fn save_total_retired(e: &Env, amount: i128) {
 }
 
 fn read_allowance(e: &Env, from: &Address, spender: &Address) -> i128 {
-    e.storage()
-        .instance()
-        .get(&DataKey::Allowance(from.clone(), spender.clone()))
-        .unwrap_or(0)
+    let key = DataKey::Allowance(from.clone(), spender.clone());
+    let val: i128 = e.storage().persistent().get(&key).unwrap_or(0);
+    if val > 0 {
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, ALLOWANCE_TTL_THRESHOLD, ALLOWANCE_TTL_BUMP);
+    }
+    val
 }
 
 fn save_allowance(e: &Env, from: &Address, spender: &Address, amount: i128) {
+    let key = DataKey::Allowance(from.clone(), spender.clone());
+    e.storage().persistent().set(&key, &amount);
     e.storage()
-        .instance()
-        .set(&DataKey::Allowance(from.clone(), spender.clone()), &amount);
+        .persistent()
+        .extend_ttl(&key, ALLOWANCE_TTL_THRESHOLD, ALLOWANCE_TTL_BUMP);
 }
 
 #[contract]
@@ -423,11 +446,8 @@ impl CreditToken {
         }
 
         // Check expiration
-        let expiration: u32 = e
-            .storage()
-            .instance()
-            .get(&DataKey::AllowanceExpiration(from.clone(), spender.clone()))
-            .unwrap_or(0);
+        let exp_key = DataKey::AllowanceExpiration(from.clone(), spender.clone());
+        let expiration: u32 = e.storage().persistent().get(&exp_key).unwrap_or(0);
         if expiration > 0 && e.ledger().sequence() >= expiration {
             // Allowance has expired — reset and reject
             save_allowance(&e, &from, &spender, 0);
@@ -454,10 +474,11 @@ impl CreditToken {
         }
         from.require_auth();
         save_allowance(&e, &from, &spender, amount);
-        e.storage().instance().set(
-            &DataKey::AllowanceExpiration(from, spender),
-            &expiration_ledger,
-        );
+        let exp_key = DataKey::AllowanceExpiration(from, spender);
+        e.storage().persistent().set(&exp_key, &expiration_ledger);
+        e.storage()
+            .persistent()
+            .extend_ttl(&exp_key, ALLOWANCE_TTL_THRESHOLD, ALLOWANCE_TTL_BUMP);
     }
 
     /// Permanently retire credits and optionally record in the retirement registry.
@@ -499,9 +520,11 @@ impl CreditToken {
             timestamp,
             metadata_uri: metadata_uri.clone(),
         };
+        let cert_key = DataKey::Cert(cert_count);
+        e.storage().persistent().set(&cert_key, &cert);
         e.storage()
-            .instance()
-            .set(&DataKey::Cert(cert_count), &cert);
+            .persistent()
+            .extend_ttl(&cert_key, CERT_TTL_THRESHOLD, CERT_TTL_BUMP);
         e.storage()
             .instance()
             .set(&DataKey::CertCount, &(cert_count + 1));
@@ -568,7 +591,14 @@ impl CreditToken {
     }
 
     pub fn get_certificate(e: Env, index: u64) -> Option<RetirementCertificate> {
-        e.storage().instance().get(&DataKey::Cert(index))
+        let key = DataKey::Cert(index);
+        let result: Option<RetirementCertificate> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, CERT_TTL_THRESHOLD, CERT_TTL_BUMP);
+        }
+        result
     }
 }
 

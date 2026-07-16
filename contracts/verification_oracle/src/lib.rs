@@ -125,25 +125,46 @@ pub struct RevealParams {
 
 #[contracttype]
 pub enum DataKey {
+    // ── Instance (loaded on every call) ──
     Admin,
-    OracleActive(Address),
     OracleCount,
-    OracleList,
+    OracleList, // bounded by max_oracles (≤10); safe in instance
     Config,
+    TotalSubmissions,
+    // ── Persistent (loaded on explicit access, survives with rent) ──
+    OracleActive(Address),
     OracleNonce((BytesN<32>, Address)),
-    WindowState(BytesN<32>),
-    OracleSubmitted(BytesN<32>, Address),
     LastResult(BytesN<32>),
-    ResultHistory(BytesN<32>),
+    /// Paginated history: ResultAt(project_id, position) → VerificationResult
+    ResultAt(BytesN<32>, u64),
+    /// Per-project result count, used for paginated history
+    ResultCount(BytesN<32>),
     ProjectConfig(BytesN<32>),
     OracleSubmitCount(Address),
-    TotalSubmissions,
     OracleStake(Address),
     OracleSlashed(Address),
+    OracleMissedReveals(Address),
+    // ── Temporary (window-scoped, can expire after finalization) ──
+    WindowState(BytesN<32>),
+    OracleSubmitted(BytesN<32>, Address),
     OracleCommitted((BytesN<32>, Address)),
     OracleRevealed((BytesN<32>, Address)),
-    OracleMissedReveals(Address),
 }
+
+// ── TTL constants ──
+/// Oracle operational data: 1 year.
+const ORACLE_TTL_THRESHOLD: u32 = 6_307_200;
+const ORACLE_TTL_BUMP: u32 = 6_307_200;
+/// Verification results and history: 10 years (audit trail).
+const RESULT_TTL_THRESHOLD: u32 = 63_072_000;
+const RESULT_TTL_BUMP: u32 = 63_072_000;
+/// Project config: 1 year.
+const PROJ_CFG_TTL_THRESHOLD: u32 = 6_307_200;
+const PROJ_CFG_TTL_BUMP: u32 = 6_307_200;
+/// Temporary window entries: 7 days (2 × commit + reveal phases, with buffer).
+/// 7 days ≈ 120_960 ledgers at 5 s/ledger.
+const WINDOW_TTL_THRESHOLD: u32 = 120_960;
+const WINDOW_TTL_BUMP: u32 = 120_960;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -202,6 +223,7 @@ fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
         }
     }
     let len = sorted.len();
+    #[allow(clippy::manual_is_multiple_of)]
     if len % 2 == 0 {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
@@ -227,6 +249,7 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
         }
     }
     let len = sorted.len();
+    #[allow(clippy::manual_is_multiple_of)]
     if len % 2 == 0 {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
@@ -279,7 +302,7 @@ impl VerificationOracle {
             panic!("unauthorized");
         }
         if e.storage()
-            .instance()
+            .persistent()
             .has(&DataKey::OracleActive(oracle.clone()))
         {
             panic!("oracle already active");
@@ -292,7 +315,7 @@ impl VerificationOracle {
         if config.min_stake > 0 {
             let stake_info: StakeInfo = e
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::OracleStake(oracle.clone()))
                 .unwrap_or(StakeInfo {
                     amount: 0,
@@ -303,8 +326,13 @@ impl VerificationOracle {
             }
         }
         e.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::OracleActive(oracle.clone()), &true);
+        e.storage().persistent().extend_ttl(
+            &DataKey::OracleActive(oracle.clone()),
+            ORACLE_TTL_THRESHOLD,
+            ORACLE_TTL_BUMP,
+        );
         e.storage()
             .instance()
             .set(&DataKey::OracleCount, &(count + 1));
@@ -324,14 +352,14 @@ impl VerificationOracle {
         }
         if !e
             .storage()
-            .instance()
+            .persistent()
             .has(&DataKey::OracleActive(oracle.clone()))
         {
             panic!("oracle not active");
         }
         let stake_info: StakeInfo = e
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleStake(oracle.clone()))
             .unwrap_or(StakeInfo {
                 amount: 0,
@@ -346,7 +374,7 @@ impl VerificationOracle {
             panic!("minimum oracles required");
         }
         e.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::OracleActive(oracle.clone()));
         e.storage()
             .instance()
@@ -367,7 +395,7 @@ impl VerificationOracle {
     /// Check if an oracle address is whitelisted and active.
     pub fn is_oracle_active(e: Env, oracle: Address) -> bool {
         e.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleActive(oracle))
             .unwrap_or(false)
     }
@@ -411,11 +439,8 @@ impl VerificationOracle {
             total_phosphorus,
         );
         if let Some(ref res) = result {
-            if let Some(config) = e
-                .storage()
-                .instance()
-                .get::<_, ProjectConfig>(&DataKey::ProjectConfig(project_id))
-            {
+            let cfg_key = DataKey::ProjectConfig(project_id);
+            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
                 let mint_args: Vec<Val> = vec![
                     &e,
                     e.current_contract_address().to_val(),
@@ -431,6 +456,7 @@ impl VerificationOracle {
         }
         result
     }
+
     fn submit_reading_impl(
         e: Env,
         oracle: Address,
@@ -448,7 +474,7 @@ impl VerificationOracle {
 
         if !e
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleActive(oracle.clone()))
             .unwrap_or(false)
         {
@@ -459,7 +485,7 @@ impl VerificationOracle {
         if config.min_stake > 0 {
             let stake_info: StakeInfo = e
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::OracleStake(oracle.clone()))
                 .unwrap_or(StakeInfo {
                     amount: 0,
@@ -470,30 +496,28 @@ impl VerificationOracle {
             }
         }
 
-        let expected_nonce: u64 = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleNonce((project_id.clone(), oracle.clone())))
-            .unwrap_or(0)
-            + 1;
+        let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
+        let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
         if nonce != expected_nonce {
             panic!("invalid nonce");
         }
-        e.storage().instance().set(
-            &DataKey::OracleNonce((project_id.clone(), oracle.clone())),
-            &nonce,
-        );
+        e.storage().persistent().set(&nonce_key, &nonce);
+        e.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
         // Track per-oracle and global submission counts
-        let oracle_count: u64 = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleSubmitCount(oracle.clone()))
-            .unwrap_or(0);
-        e.storage().instance().set(
-            &DataKey::OracleSubmitCount(oracle.clone()),
-            &(oracle_count + 1),
+        let submit_count_key = DataKey::OracleSubmitCount(oracle.clone());
+        let oracle_count: u64 = e.storage().persistent().get(&submit_count_key).unwrap_or(0);
+        e.storage()
+            .persistent()
+            .set(&submit_count_key, &(oracle_count + 1));
+        e.storage().persistent().extend_ttl(
+            &submit_count_key,
+            ORACLE_TTL_THRESHOLD,
+            ORACLE_TTL_BUMP,
         );
+
         let total: u64 = e
             .storage()
             .instance()
@@ -503,24 +527,23 @@ impl VerificationOracle {
             .instance()
             .set(&DataKey::TotalSubmissions, &(total + 1));
 
-        // Prevent duplicate oracle per window
-        if e.storage().instance().has(&DataKey::OracleSubmitted(
-            project_id.clone(),
-            oracle.clone(),
-        )) {
+        // Prevent duplicate oracle per window (temporary storage)
+        let submitted_key = DataKey::OracleSubmitted(project_id.clone(), oracle.clone());
+        if e.storage().temporary().has(&submitted_key) {
             panic!("oracle already submitted for this window");
         }
 
-        let mut window: WindowState = e
-            .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()))
-            .unwrap_or(WindowState {
-                phase: WindowPhase::Reveal,
-                opened_at: e.ledger().timestamp(),
-                submissions: Vec::new(&e),
-                finalized: false,
-            });
+        let window_key = DataKey::WindowState(project_id.clone());
+        let mut window: WindowState =
+            e.storage()
+                .temporary()
+                .get(&window_key)
+                .unwrap_or(WindowState {
+                    phase: WindowPhase::Reveal,
+                    opened_at: e.ledger().timestamp(),
+                    submissions: Vec::new(&e),
+                    finalized: false,
+                });
 
         if window.finalized {
             panic!("window already finalized");
@@ -542,14 +565,15 @@ impl VerificationOracle {
         };
 
         window.submissions.push_back(submission);
+        e.storage().temporary().set(&window_key, &window);
         e.storage()
-            .instance()
-            .set(&DataKey::WindowState(project_id.clone()), &window);
+            .temporary()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
-        e.storage().instance().set(
-            &DataKey::OracleSubmitted(project_id.clone(), oracle.clone()),
-            &true,
-        );
+        e.storage().temporary().set(&submitted_key, &true);
+        e.storage()
+            .temporary()
+            .extend_ttl(&submitted_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         if window.submissions.len() >= config.min_oracles {
             let subs = &window.submissions;
@@ -642,25 +666,29 @@ impl VerificationOracle {
                 finalized_at: e.ledger().timestamp(),
             };
 
+            // Persist last result
+            let last_key = DataKey::LastResult(project_id.clone());
+            e.storage().persistent().set(&last_key, &result);
             e.storage()
-                .instance()
-                .set(&DataKey::LastResult(project_id.clone()), &result);
+                .persistent()
+                .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
-            // Append to historical results
-            let mut history: Vec<VerificationResult> = e
-                .storage()
-                .instance()
-                .get(&DataKey::ResultHistory(project_id.clone()))
-                .unwrap_or_else(|| Vec::new(&e));
-            history.push_back(result.clone());
+            // Append to paginated history
+            let count_key = DataKey::ResultCount(project_id.clone());
+            let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+            let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
+            e.storage().persistent().set(&hist_key, &result);
             e.storage()
-                .instance()
-                .set(&DataKey::ResultHistory(project_id.clone()), &history);
+                .persistent()
+                .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+            e.storage().persistent().set(&count_key, &(hist_pos + 1));
+            e.storage()
+                .persistent()
+                .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
             window.finalized = true;
-            e.storage()
-                .instance()
-                .set(&DataKey::WindowState(project_id.clone()), &window);
+            e.storage().temporary().set(&window_key, &window);
+            // no extend needed — finalized windows can expire
 
             e.events()
                 .publish((EVENT_READING_VERIFIED,), (project_id, result.clone()));
@@ -689,29 +717,67 @@ impl VerificationOracle {
             token_contract,
             beneficiary,
         };
+        let key = DataKey::ProjectConfig(project_id);
+        e.storage().persistent().set(&key, &config);
         e.storage()
-            .instance()
-            .set(&DataKey::ProjectConfig(project_id), &config);
+            .persistent()
+            .extend_ttl(&key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
     }
 
     /// Get the project config (token contract and beneficiary) for a project.
     pub fn get_project_config(e: Env, project_id: BytesN<32>) -> Option<ProjectConfig> {
-        e.storage()
-            .instance()
-            .get(&DataKey::ProjectConfig(project_id))
+        let key = DataKey::ProjectConfig(project_id);
+        let result: Option<ProjectConfig> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+        }
+        result
     }
 
     /// Get the last verification result for a project. Returns None if no window has been finalized.
     pub fn get_last_result(e: Env, project_id: BytesN<32>) -> Option<VerificationResult> {
-        e.storage().instance().get(&DataKey::LastResult(project_id))
+        let key = DataKey::LastResult(project_id);
+        let result: Option<VerificationResult> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+        }
+        result
     }
 
-    /// Get the full history of verification results for a project.
-    pub fn get_result_history(e: Env, project_id: BytesN<32>) -> Vec<VerificationResult> {
+    /// Get paginated history of verification results for a project.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    pub fn get_result_history(
+        e: Env,
+        project_id: BytesN<32>,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<VerificationResult> {
+        let count_key = DataKey::ResultCount(project_id.clone());
+        let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+        let end = (offset + limit as u64).min(total);
+        let mut results: Vec<VerificationResult> = Vec::new(&e);
+        for pos in offset..end {
+            let key = DataKey::ResultAt(project_id.clone(), pos);
+            if let Some(r) = e.storage().persistent().get::<_, VerificationResult>(&key) {
+                e.storage()
+                    .persistent()
+                    .extend_ttl(&key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+                results.push_back(r);
+            }
+        }
+        results
+    }
+
+    /// Get the total number of stored results for a project.
+    pub fn result_count(e: Env, project_id: BytesN<32>) -> u64 {
         e.storage()
-            .instance()
-            .get(&DataKey::ResultHistory(project_id))
-            .unwrap_or_else(|| Vec::new(&e))
+            .persistent()
+            .get(&DataKey::ResultCount(project_id))
+            .unwrap_or(0)
     }
 
     /// Get the current oracle configuration parameters.
@@ -722,7 +788,7 @@ impl VerificationOracle {
     /// Get the total number of readings an oracle has submitted across all projects and windows.
     pub fn oracle_submit_count(e: Env, oracle: Address) -> u64 {
         e.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleSubmitCount(oracle))
             .unwrap_or(0)
     }
@@ -764,10 +830,8 @@ impl VerificationOracle {
             panic!("unauthorized");
         }
 
-        let window: Option<WindowState> = e
-            .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()));
+        let window_key = DataKey::WindowState(project_id.clone());
+        let window: Option<WindowState> = e.storage().temporary().get(&window_key);
 
         match window {
             None => panic!("no window found for project"),
@@ -780,7 +844,7 @@ impl VerificationOracle {
         for i in 0..window.submissions.len() {
             let sub = window.submissions.get(i).unwrap();
             e.storage()
-                .instance()
+                .temporary()
                 .remove(&DataKey::OracleSubmitted(project_id.clone(), sub.oracle));
         }
 
@@ -791,9 +855,10 @@ impl VerificationOracle {
             submissions: Vec::new(&e),
             finalized: false,
         };
+        e.storage().temporary().set(&window_key, &fresh);
         e.storage()
-            .instance()
-            .set(&DataKey::WindowState(project_id.clone()), &fresh);
+            .temporary()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
     }
 
     /// Get the number of submissions in the current open window for a project.
@@ -801,7 +866,7 @@ impl VerificationOracle {
     pub fn window_submission_count(e: Env, project_id: BytesN<32>) -> u32 {
         let window: Option<WindowState> = e
             .storage()
-            .instance()
+            .temporary()
             .get(&DataKey::WindowState(project_id));
         match window {
             None => 0,
@@ -832,19 +897,21 @@ impl VerificationOracle {
             transfer_args,
         );
 
-        let mut stake_info: StakeInfo = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleStake(oracle.clone()))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            });
+        let stake_key = DataKey::OracleStake(oracle.clone());
+        let mut stake_info: StakeInfo =
+            e.storage()
+                .persistent()
+                .get(&stake_key)
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    unstake_request: None,
+                });
         stake_info.amount += amount;
         stake_info.unstake_request = None;
+        e.storage().persistent().set(&stake_key, &stake_info);
         e.storage()
-            .instance()
-            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+            .persistent()
+            .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
         e.events().publish((EVENT_ORACLE_STAKED,), (oracle, amount));
     }
@@ -858,19 +925,20 @@ impl VerificationOracle {
             panic!("unstake amount must be positive");
         }
         let config: OracleConfig = read_config(&e);
-        let mut stake_info: StakeInfo = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleStake(oracle.clone()))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            });
+        let stake_key = DataKey::OracleStake(oracle.clone());
+        let mut stake_info: StakeInfo =
+            e.storage()
+                .persistent()
+                .get(&stake_key)
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    unstake_request: None,
+                });
         if stake_info.amount < amount {
             panic!("insufficient staked balance");
         }
         if e.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleActive(oracle.clone()))
             .unwrap_or(false)
         {
@@ -882,9 +950,10 @@ impl VerificationOracle {
         let now = e.ledger().timestamp();
         stake_info.amount -= amount;
         stake_info.unstake_request = Some(now + config.unstake_cooldown_secs);
+        e.storage().persistent().set(&stake_key, &stake_info);
         e.storage()
-            .instance()
-            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+            .persistent()
+            .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
         e.events()
             .publish((EVENT_ORACLE_UNSTAKED,), (oracle, amount));
@@ -893,10 +962,11 @@ impl VerificationOracle {
     /// Claim unstaked tokens after the cooldown period has elapsed.
     pub fn claim_unstake(e: Env, oracle: Address) {
         oracle.require_auth();
+        let stake_key = DataKey::OracleStake(oracle.clone());
         let stake_info: StakeInfo = e
             .storage()
-            .instance()
-            .get(&DataKey::OracleStake(oracle.clone()))
+            .persistent()
+            .get(&stake_key)
             .unwrap_or(StakeInfo {
                 amount: 0,
                 unstake_request: None,
@@ -921,13 +991,16 @@ impl VerificationOracle {
             transfer_args,
         );
 
-        e.storage().instance().set(
-            &DataKey::OracleStake(oracle.clone()),
+        e.storage().persistent().set(
+            &stake_key,
             &StakeInfo {
                 amount: 0,
                 unstake_request: None,
             },
         );
+        e.storage()
+            .persistent()
+            .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
     }
 
     /// Slash an oracle's stake. Callable by admin or governance.
@@ -942,21 +1015,23 @@ impl VerificationOracle {
         if amount <= 0 {
             panic!("slash amount must be positive");
         }
-        let mut stake_info: StakeInfo = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleStake(oracle.clone()))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            });
+        let stake_key = DataKey::OracleStake(oracle.clone());
+        let mut stake_info: StakeInfo =
+            e.storage()
+                .persistent()
+                .get(&stake_key)
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    unstake_request: None,
+                });
         if stake_info.amount < amount {
             panic!("slash exceeds staked balance");
         }
         stake_info.amount -= amount;
+        e.storage().persistent().set(&stake_key, &stake_info);
         e.storage()
-            .instance()
-            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+            .persistent()
+            .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
         let config: OracleConfig = read_config(&e);
         let transfer_args: Vec<Val> = vec![
@@ -975,9 +1050,11 @@ impl VerificationOracle {
             reason,
             timestamp: e.ledger().timestamp(),
         };
+        let slash_key = DataKey::OracleSlashed(oracle.clone());
+        e.storage().persistent().set(&slash_key, &slash_record);
         e.storage()
-            .instance()
-            .set(&DataKey::OracleSlashed(oracle.clone()), &slash_record);
+            .persistent()
+            .extend_ttl(&slash_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
         e.events()
             .publish((EVENT_ORACLE_SLASHED,), (oracle, amount, reason));
@@ -986,7 +1063,7 @@ impl VerificationOracle {
     /// Get the current staked balance and unstake request for an oracle.
     pub fn get_stake(e: Env, oracle: Address) -> StakeInfo {
         e.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleStake(oracle))
             .unwrap_or(StakeInfo {
                 amount: 0,
@@ -996,7 +1073,9 @@ impl VerificationOracle {
 
     /// Get the slash record for an oracle (most recent slash).
     pub fn get_slash_record(e: Env, oracle: Address) -> Option<SlashReason> {
-        e.storage().instance().get(&DataKey::OracleSlashed(oracle))
+        e.storage()
+            .persistent()
+            .get(&DataKey::OracleSlashed(oracle))
     }
 
     /// Get the unstake cooldown period in seconds.
@@ -1028,10 +1107,8 @@ impl VerificationOracle {
             panic!("unauthorized");
         }
 
-        let existing: Option<WindowState> = e
-            .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()));
+        let window_key = DataKey::WindowState(project_id.clone());
+        let existing: Option<WindowState> = e.storage().temporary().get(&window_key);
         match existing {
             Some(ref w) if !w.finalized => panic!("window already active"),
             _ => {}
@@ -1043,9 +1120,10 @@ impl VerificationOracle {
             submissions: Vec::new(&e),
             finalized: false,
         };
+        e.storage().temporary().set(&window_key, &window);
         e.storage()
-            .instance()
-            .set(&DataKey::WindowState(project_id.clone()), &window);
+            .temporary()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events().publish((EVENT_WINDOW_OPENED,), (project_id,));
     }
@@ -1054,7 +1132,7 @@ impl VerificationOracle {
     pub fn get_window_phase(e: Env, project_id: BytesN<32>) -> Option<WindowPhase> {
         let window: Option<WindowState> = e
             .storage()
-            .instance()
+            .temporary()
             .get(&DataKey::WindowState(project_id));
         window.map(|w| w.phase)
     }
@@ -1072,7 +1150,7 @@ impl VerificationOracle {
 
         if !e
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleActive(oracle.clone()))
             .unwrap_or(false)
         {
@@ -1083,7 +1161,7 @@ impl VerificationOracle {
         if config.min_stake > 0 {
             let stake_info: StakeInfo = e
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::OracleStake(oracle.clone()))
                 .unwrap_or(StakeInfo {
                     amount: 0,
@@ -1094,20 +1172,17 @@ impl VerificationOracle {
             }
         }
 
-        let expected_nonce: u64 = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleNonce((project_id.clone(), oracle.clone())))
-            .unwrap_or(0)
-            + 1;
+        let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
+        let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
         if nonce != expected_nonce {
             panic!("invalid nonce");
         }
 
+        let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()))
+            .temporary()
+            .get(&window_key)
             .expect("no window open");
 
         if window.finalized {
@@ -1117,23 +1192,26 @@ impl VerificationOracle {
             panic!("not in commit phase");
         }
 
-        let key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
-        if e.storage().instance().has(&key) {
+        let commit_key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
+        if e.storage().temporary().has(&commit_key) {
             panic!("oracle already committed");
         }
 
-        e.storage().instance().set(
-            &DataKey::OracleNonce((project_id.clone(), oracle.clone())),
-            &nonce,
-        );
+        e.storage().persistent().set(&nonce_key, &nonce);
+        e.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
-        e.storage().instance().set(
-            &key,
+        e.storage().temporary().set(
+            &commit_key,
             &CommitInfo {
                 commitment: commitment.clone(),
                 nonce,
             },
         );
+        e.storage()
+            .temporary()
+            .extend_ttl(&commit_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events()
             .publish((EVENT_ORACLE_COMMITTED,), (oracle, project_id, commitment));
@@ -1142,10 +1220,11 @@ impl VerificationOracle {
     /// Transition a window from commit phase to reveal phase.
     /// Callable by anyone after the commit phase duration has elapsed.
     pub fn begin_reveal_phase(e: Env, project_id: BytesN<32>) {
+        let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()))
+            .temporary()
+            .get(&window_key)
             .expect("no window open");
 
         if window.finalized {
@@ -1163,9 +1242,10 @@ impl VerificationOracle {
 
         let mut window = window;
         window.phase = WindowPhase::Reveal;
+        e.storage().temporary().set(&window_key, &window);
         e.storage()
-            .instance()
-            .set(&DataKey::WindowState(project_id.clone()), &window);
+            .temporary()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
     }
 
     /// Reveal the actual reading values + salt during the reveal phase.
@@ -1180,7 +1260,7 @@ impl VerificationOracle {
 
         if !e
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleActive(oracle.clone()))
             .unwrap_or(false)
         {
@@ -1191,7 +1271,7 @@ impl VerificationOracle {
         if config.min_stake > 0 {
             let stake_info: StakeInfo = e
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::OracleStake(oracle.clone()))
                 .unwrap_or(StakeInfo {
                     amount: 0,
@@ -1202,10 +1282,11 @@ impl VerificationOracle {
             }
         }
 
+        let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState = e
             .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()))
+            .temporary()
+            .get(&window_key)
             .expect("no window open");
 
         if window.finalized {
@@ -1218,7 +1299,7 @@ impl VerificationOracle {
         let commit_key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
         let commit_info: CommitInfo = e
             .storage()
-            .instance()
+            .temporary()
             .get(&commit_key)
             .expect("oracle did not commit");
 
@@ -1227,7 +1308,7 @@ impl VerificationOracle {
         }
 
         let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
-        if e.storage().instance().has(&reveal_key) {
+        if e.storage().temporary().has(&reveal_key) {
             panic!("oracle already revealed");
         }
 
@@ -1249,15 +1330,15 @@ impl VerificationOracle {
         }
 
         // Track per-oracle and global submission counts
-        let oracle_count: u64 = e
-            .storage()
-            .instance()
-            .get(&DataKey::OracleSubmitCount(oracle.clone()))
-            .unwrap_or(0);
-        e.storage().instance().set(
-            &DataKey::OracleSubmitCount(oracle.clone()),
-            &(oracle_count + 1),
-        );
+        let submit_key = DataKey::OracleSubmitCount(oracle.clone());
+        let oracle_submit_count: u64 = e.storage().persistent().get(&submit_key).unwrap_or(0);
+        e.storage()
+            .persistent()
+            .set(&submit_key, &(oracle_submit_count + 1));
+        e.storage()
+            .persistent()
+            .extend_ttl(&submit_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+
         let total: u64 = e
             .storage()
             .instance()
@@ -1283,11 +1364,15 @@ impl VerificationOracle {
         };
 
         window.submissions.push_back(submission);
+        e.storage().temporary().set(&window_key, &window);
         e.storage()
-            .instance()
-            .set(&DataKey::WindowState(project_id.clone()), &window);
+            .temporary()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
-        e.storage().instance().set(&reveal_key, &true);
+        e.storage().temporary().set(&reveal_key, &true);
+        e.storage()
+            .temporary()
+            .extend_ttl(&reveal_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events()
             .publish((EVENT_ORACLE_REVEALED,), (oracle, project_id.clone()));
@@ -1303,10 +1388,11 @@ impl VerificationOracle {
     /// Penalizes oracles that committed but did not reveal.
     /// Can be called by anyone once the reveal phase duration has elapsed.
     pub fn finalize_window(e: Env, project_id: BytesN<32>) -> Option<VerificationResult> {
+        let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()))
+            .temporary()
+            .get(&window_key)
             .expect("no window open");
 
         if window.finalized {
@@ -1342,37 +1428,41 @@ impl VerificationOracle {
             let commit_key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
             let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
 
-            let committed = e.storage().instance().has(&commit_key);
-            let revealed = e.storage().instance().has(&reveal_key);
+            let committed = e.storage().temporary().has(&commit_key);
+            let revealed = e.storage().temporary().has(&reveal_key);
 
             if committed && !revealed {
                 // Increment missed reveals counter
-                let missed: u64 = e
-                    .storage()
-                    .instance()
-                    .get(&DataKey::OracleMissedReveals(oracle.clone()))
-                    .unwrap_or(0);
-                e.storage()
-                    .instance()
-                    .set(&DataKey::OracleMissedReveals(oracle.clone()), &(missed + 1));
+                let missed_key = DataKey::OracleMissedReveals(oracle.clone());
+                let missed: u64 = e.storage().persistent().get(&missed_key).unwrap_or(0);
+                e.storage().persistent().set(&missed_key, &(missed + 1));
+                e.storage().persistent().extend_ttl(
+                    &missed_key,
+                    ORACLE_TTL_THRESHOLD,
+                    ORACLE_TTL_BUMP,
+                );
 
                 // Slash the oracle's stake
-                let mut stake_info: StakeInfo = e
-                    .storage()
-                    .instance()
-                    .get(&DataKey::OracleStake(oracle.clone()))
-                    .unwrap_or(StakeInfo {
-                        amount: 0,
-                        unstake_request: None,
-                    });
+                let stake_key = DataKey::OracleStake(oracle.clone());
+                let mut stake_info: StakeInfo =
+                    e.storage()
+                        .persistent()
+                        .get(&stake_key)
+                        .unwrap_or(StakeInfo {
+                            amount: 0,
+                            unstake_request: None,
+                        });
 
                 if stake_info.amount > 0 {
                     let slash_amount = stake_info.amount.min(config.min_stake);
                     if slash_amount > 0 {
                         stake_info.amount -= slash_amount;
-                        e.storage()
-                            .instance()
-                            .set(&DataKey::OracleStake(oracle.clone()), &stake_info);
+                        e.storage().persistent().set(&stake_key, &stake_info);
+                        e.storage().persistent().extend_ttl(
+                            &stake_key,
+                            ORACLE_TTL_THRESHOLD,
+                            ORACLE_TTL_BUMP,
+                        );
 
                         let transfer_args: Vec<Val> = vec![
                             e,
@@ -1390,9 +1480,13 @@ impl VerificationOracle {
                             reason: 3, // missed_reveal
                             timestamp: e.ledger().timestamp(),
                         };
-                        e.storage()
-                            .instance()
-                            .set(&DataKey::OracleSlashed(oracle.clone()), &slash_record);
+                        let slash_key = DataKey::OracleSlashed(oracle.clone());
+                        e.storage().persistent().set(&slash_key, &slash_record);
+                        e.storage().persistent().extend_ttl(
+                            &slash_key,
+                            ORACLE_TTL_THRESHOLD,
+                            ORACLE_TTL_BUMP,
+                        );
 
                         e.events().publish(
                             (EVENT_ORACLE_MISSED_REVEAL,),
@@ -1401,8 +1495,8 @@ impl VerificationOracle {
                     }
                 }
 
-                // Clean up commitment
-                e.storage().instance().remove(&commit_key);
+                // Clean up commitment from temporary storage
+                e.storage().temporary().remove(&commit_key);
             }
         }
     }
@@ -1410,10 +1504,11 @@ impl VerificationOracle {
     /// Internal: finalize a window with current submissions (used by both
     /// auto-finalization in reveal_reading and explicit finalize_window).
     fn finalize_reveals(e: Env, project_id: BytesN<32>) -> Option<VerificationResult> {
+        let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState = e
             .storage()
-            .instance()
-            .get(&DataKey::WindowState(project_id.clone()))
+            .temporary()
+            .get(&window_key)
             .expect("no window open");
 
         if window.finalized {
@@ -1507,25 +1602,30 @@ impl VerificationOracle {
             finalized_at: e.ledger().timestamp(),
         };
 
+        // Persist last result
+        let last_key = DataKey::LastResult(project_id.clone());
+        e.storage().persistent().set(&last_key, &result);
         e.storage()
-            .instance()
-            .set(&DataKey::LastResult(project_id.clone()), &result);
+            .persistent()
+            .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
-        let mut history: Vec<VerificationResult> = e
-            .storage()
-            .instance()
-            .get(&DataKey::ResultHistory(project_id.clone()))
-            .unwrap_or_else(|| Vec::new(&e));
-        history.push_back(result.clone());
+        // Append to paginated history
+        let count_key = DataKey::ResultCount(project_id.clone());
+        let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+        let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
+        e.storage().persistent().set(&hist_key, &result);
         e.storage()
-            .instance()
-            .set(&DataKey::ResultHistory(project_id.clone()), &history);
+            .persistent()
+            .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+        e.storage().persistent().set(&count_key, &(hist_pos + 1));
+        e.storage()
+            .persistent()
+            .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
         window.finalized = true;
         window.phase = WindowPhase::Finalized;
-        e.storage()
-            .instance()
-            .set(&DataKey::WindowState(project_id.clone()), &window);
+        // Write finalized state back; window will naturally expire via TTL
+        e.storage().temporary().set(&window_key, &window);
 
         // Clean up commit/reveal markers for all oracles in this window
         let oracles: Vec<Address> = e
@@ -1535,11 +1635,11 @@ impl VerificationOracle {
             .unwrap_or_else(|| Vec::new(&e));
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
-            e.storage().instance().remove(&DataKey::OracleCommitted((
+            e.storage().temporary().remove(&DataKey::OracleCommitted((
                 project_id.clone(),
                 oracle.clone(),
             )));
-            e.storage().instance().remove(&DataKey::OracleRevealed((
+            e.storage().temporary().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 oracle.clone(),
             )));
@@ -1554,7 +1654,7 @@ impl VerificationOracle {
     /// Get the number of missed reveals for an oracle across all windows.
     pub fn oracle_missed_reveals(e: Env, oracle: Address) -> u64 {
         e.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OracleMissedReveals(oracle))
             .unwrap_or(0)
     }
@@ -1785,7 +1885,7 @@ mod tests {
         client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
 
-        let history = client.get_result_history(&project_id);
+        let history = client.get_result_history(&project_id, &0, &10);
         assert_eq!(history.len(), 1);
 
         client.reset_window(&admin, &project_id);
@@ -1793,7 +1893,7 @@ mod tests {
         client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
 
-        let history = client.get_result_history(&project_id);
+        let history = client.get_result_history(&project_id, &0, &10);
         assert_eq!(history.len(), 2);
 
         assert_eq!(history.get(0).unwrap().oracle_count, 3);

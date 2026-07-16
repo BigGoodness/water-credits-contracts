@@ -4,6 +4,17 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, St
 #[cfg(test)]
 extern crate std;
 
+// ── TTL constants ──
+/// Retirement records are permanent audit trails: 10 years.
+const RECORD_TTL_THRESHOLD: u32 = 63_072_000;
+const RECORD_TTL_BUMP: u32 = 63_072_000;
+/// Index entries share the record lifetime.
+const INDEX_TTL_THRESHOLD: u32 = 63_072_000;
+const INDEX_TTL_BUMP: u32 = 63_072_000;
+/// AuthorizedCaller entries: 1 year.
+const AUTH_TTL_THRESHOLD: u32 = 6_307_200;
+const AUTH_TTL_BUMP: u32 = 6_307_200;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetirementRecord {
@@ -16,15 +27,31 @@ pub struct RetirementRecord {
     pub timestamp: u64,
 }
 
+/// Storage key enum.
+///
+/// Instance:  Admin, RecordCount, TotalRetired
+/// Persistent: Record(u64), AuthorizedCaller(Address),
+///             RetireeIndex(Address, u64), ProjectIndex(BytesN<32>, u64)
+///
+/// The old Vec<u64> secondary indexes (RetireeRecords, ProjectRecords) are
+/// replaced by compound keys:
+///   RetireeIndex(retiree, position)  → record_id: u64
+///   RetireeCount(retiree)            → count: u64   (how many entries this retiree has)
+///   ProjectIndex(project_id, pos)   → record_id: u64
+///   ProjectCount(project_id)        → count: u64
 #[contracttype]
 pub enum DataKey {
+    // ── Instance ──
     Admin,
     RecordCount,
     TotalRetired,
+    // ── Persistent ──
     Record(u64),
-    RetireeRecords(Address),
-    ProjectRecords(BytesN<32>),
     AuthorizedCaller(Address),
+    RetireeIndex(Address, u64),
+    RetireeCount(Address),
+    ProjectIndex(BytesN<32>, u64),
+    ProjectCount(BytesN<32>),
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -63,11 +90,8 @@ impl RetirementRegistry {
     ) -> u64 {
         caller.require_auth();
         let stored: Address = read_admin(&e);
-        let authorized = e
-            .storage()
-            .instance()
-            .get(&DataKey::AuthorizedCaller(caller.clone()))
-            .unwrap_or(false);
+        let auth_key = DataKey::AuthorizedCaller(caller.clone());
+        let authorized: bool = e.storage().persistent().get(&auth_key).unwrap_or(false);
         if caller != stored && !authorized {
             panic!("unauthorized");
         }
@@ -90,30 +114,58 @@ impl RetirementRegistry {
             timestamp,
         };
 
+        // Persist the record
+        let rec_key = DataKey::Record(record_id);
+        e.storage().persistent().set(&rec_key, &record);
         e.storage()
-            .instance()
-            .set(&DataKey::Record(record_id), &record);
+            .persistent()
+            .extend_ttl(&rec_key, RECORD_TTL_THRESHOLD, RECORD_TTL_BUMP);
 
-        let mut retiree_ids: Vec<u64> = e
+        // Update retiree compound-key index
+        let retiree_count_key = DataKey::RetireeCount(retiree.clone());
+        let retiree_pos: u64 = e
             .storage()
-            .instance()
-            .get(&DataKey::RetireeRecords(retiree.clone()))
-            .unwrap_or(Vec::new(&e));
-        retiree_ids.push_back(record_id);
+            .persistent()
+            .get(&retiree_count_key)
+            .unwrap_or(0);
+        let idx_key = DataKey::RetireeIndex(retiree.clone(), retiree_pos);
+        e.storage().persistent().set(&idx_key, &record_id);
         e.storage()
-            .instance()
-            .set(&DataKey::RetireeRecords(retiree.clone()), &retiree_ids);
+            .persistent()
+            .extend_ttl(&idx_key, INDEX_TTL_THRESHOLD, INDEX_TTL_BUMP);
+        let new_retiree_pos = retiree_pos + 1;
+        e.storage()
+            .persistent()
+            .set(&retiree_count_key, &new_retiree_pos);
+        e.storage().persistent().extend_ttl(
+            &retiree_count_key,
+            INDEX_TTL_THRESHOLD,
+            INDEX_TTL_BUMP,
+        );
 
-        let mut project_ids: Vec<u64> = e
+        // Update project compound-key index
+        let project_count_key = DataKey::ProjectCount(project_id.clone());
+        let project_pos: u64 = e
             .storage()
-            .instance()
-            .get(&DataKey::ProjectRecords(project_id.clone()))
-            .unwrap_or(Vec::new(&e));
-        project_ids.push_back(record_id);
+            .persistent()
+            .get(&project_count_key)
+            .unwrap_or(0);
+        let pidx_key = DataKey::ProjectIndex(project_id.clone(), project_pos);
+        e.storage().persistent().set(&pidx_key, &record_id);
         e.storage()
-            .instance()
-            .set(&DataKey::ProjectRecords(project_id.clone()), &project_ids);
+            .persistent()
+            .extend_ttl(&pidx_key, INDEX_TTL_THRESHOLD, INDEX_TTL_BUMP);
+        let new_project_pos = project_pos + 1;
+        e.storage()
+            .persistent()
+            .set(&project_count_key, &new_project_pos);
+        e.storage().persistent().extend_ttl(
+            &project_count_key,
+            INDEX_TTL_THRESHOLD,
+            INDEX_TTL_BUMP,
+        );
 
+        // Update global scalars
         let total: i128 = e.storage().instance().get(&DataKey::TotalRetired).unwrap();
         e.storage()
             .instance()
@@ -127,7 +179,14 @@ impl RetirementRegistry {
 
     /// Get a retirement record by its ID. Returns None if not found.
     pub fn get_record(e: Env, id: u64) -> Option<RetirementRecord> {
-        e.storage().instance().get(&DataKey::Record(id))
+        let key = DataKey::Record(id);
+        let result: Option<RetirementRecord> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, RECORD_TTL_THRESHOLD, RECORD_TTL_BUMP);
+        }
+        result
     }
 
     /// Get the global total amount of credits retired across all projects.
@@ -147,46 +206,95 @@ impl RetirementRegistry {
         if admin != stored {
             panic!("unauthorized");
         }
+        let key = DataKey::AuthorizedCaller(caller);
+        e.storage().persistent().set(&key, &authorized);
         e.storage()
-            .instance()
-            .set(&DataKey::AuthorizedCaller(caller), &authorized);
+            .persistent()
+            .extend_ttl(&key, AUTH_TTL_THRESHOLD, AUTH_TTL_BUMP);
     }
 
-    /// Get all retirement records for a given retiree address.
-    pub fn get_retirements_by_retiree(e: Env, retiree: Address) -> Vec<RetirementRecord> {
-        let ids: Vec<u64> = e
-            .storage()
-            .instance()
-            .get(&DataKey::RetireeRecords(retiree))
-            .unwrap_or(Vec::new(&e));
+    /// Get paginated retirement records for a given retiree address.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    pub fn get_retirements_by_retiree(
+        e: Env,
+        retiree: Address,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<RetirementRecord> {
+        let count_key = DataKey::RetireeCount(retiree.clone());
+        let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
 
         let mut records: Vec<RetirementRecord> = Vec::new(&e);
-        for i in 0..ids.len() {
-            let id = ids.get(i).unwrap();
-            if let Some(record) = e.storage().instance().get(&DataKey::Record(id)) {
-                records.push_back(record);
+        let end = (offset + limit as u64).min(total);
+        for pos in offset..end {
+            let idx_key = DataKey::RetireeIndex(retiree.clone(), pos);
+            if let Some(record_id) = e.storage().persistent().get::<_, u64>(&idx_key) {
+                let rec_key = DataKey::Record(record_id);
+                if let Some(record) = e
+                    .storage()
+                    .persistent()
+                    .get::<_, RetirementRecord>(&rec_key)
+                {
+                    e.storage().persistent().extend_ttl(
+                        &rec_key,
+                        RECORD_TTL_THRESHOLD,
+                        RECORD_TTL_BUMP,
+                    );
+                    records.push_back(record);
+                }
             }
         }
         records
     }
 
-    /// Get all retirement records for a given project ID.
-    /// Useful for computing total retired supply per project and for audit trails.
-    pub fn get_retirements_by_project(e: Env, project_id: BytesN<32>) -> Vec<RetirementRecord> {
-        let ids: Vec<u64> = e
-            .storage()
-            .instance()
-            .get(&DataKey::ProjectRecords(project_id))
-            .unwrap_or(Vec::new(&e));
+    /// Get paginated retirement records for a given project ID.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    pub fn get_retirements_by_project(
+        e: Env,
+        project_id: BytesN<32>,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<RetirementRecord> {
+        let count_key = DataKey::ProjectCount(project_id.clone());
+        let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
 
         let mut records: Vec<RetirementRecord> = Vec::new(&e);
-        for i in 0..ids.len() {
-            let id = ids.get(i).unwrap();
-            if let Some(record) = e.storage().instance().get(&DataKey::Record(id)) {
-                records.push_back(record);
+        let end = (offset + limit as u64).min(total);
+        for pos in offset..end {
+            let idx_key = DataKey::ProjectIndex(project_id.clone(), pos);
+            if let Some(record_id) = e.storage().persistent().get::<_, u64>(&idx_key) {
+                let rec_key = DataKey::Record(record_id);
+                if let Some(record) = e
+                    .storage()
+                    .persistent()
+                    .get::<_, RetirementRecord>(&rec_key)
+                {
+                    e.storage().persistent().extend_ttl(
+                        &rec_key,
+                        RECORD_TTL_THRESHOLD,
+                        RECORD_TTL_BUMP,
+                    );
+                    records.push_back(record);
+                }
             }
         }
         records
+    }
+
+    /// Get the total number of retirements for a specific retiree.
+    pub fn retiree_count(e: Env, retiree: Address) -> u64 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::RetireeCount(retiree))
+            .unwrap_or(0)
+    }
+
+    /// Get the total number of retirements for a specific project.
+    pub fn project_retirement_count(e: Env, project_id: BytesN<32>) -> u64 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::ProjectCount(project_id))
+            .unwrap_or(0)
     }
 }
 
@@ -252,12 +360,13 @@ mod tests {
         assert_eq!(client.record_count(), 3);
         assert_eq!(client.total_retired(), 600);
 
-        let records1 = client.get_retirements_by_retiree(&retiree1);
+        // Paginated query for retiree1 — page 0, up to 10 results
+        let records1 = client.get_retirements_by_retiree(&retiree1, &0, &10);
         assert_eq!(records1.len(), 2);
         assert_eq!(records1.get(0).unwrap().amount, 300);
         assert_eq!(records1.get(1).unwrap().amount, 200);
 
-        let records2 = client.get_retirements_by_retiree(&retiree2);
+        let records2 = client.get_retirements_by_retiree(&retiree2, &0, &10);
         assert_eq!(records2.len(), 1);
         assert_eq!(records2.get(0).unwrap().amount, 100);
     }
@@ -288,7 +397,7 @@ mod tests {
     fn test_empty_retiree_records() {
         let (e, _admin, client) = setup();
         let retiree = Address::generate(&e);
-        let records = client.get_retirements_by_retiree(&retiree);
+        let records = client.get_retirements_by_retiree(&retiree, &0, &10);
         assert_eq!(records.len(), 0);
     }
 
@@ -308,7 +417,7 @@ mod tests {
         client.record_retirement(&admin, &retiree2, &project_a, &200, &purpose, &uri);
         client.record_retirement(&admin, &retiree1, &project_b, &100, &purpose, &uri);
 
-        let proj_a_records = client.get_retirements_by_project(&project_a);
+        let proj_a_records = client.get_retirements_by_project(&project_a, &0, &10);
         assert_eq!(proj_a_records.len(), 2);
 
         let total_a: i128 = (0..proj_a_records.len())
@@ -316,7 +425,7 @@ mod tests {
             .sum();
         assert_eq!(total_a, 500);
 
-        let proj_b_records = client.get_retirements_by_project(&project_b);
+        let proj_b_records = client.get_retirements_by_project(&project_b, &0, &10);
         assert_eq!(proj_b_records.len(), 1);
         assert_eq!(proj_b_records.get(0).unwrap().amount, 100);
     }
@@ -325,7 +434,80 @@ mod tests {
     fn test_get_retirements_by_project_empty() {
         let (e, _admin, client) = setup();
         let project_id = BytesN::from_array(&e, &[0xffu8; 32]);
-        let records = client.get_retirements_by_project(&project_id);
+        let records = client.get_retirements_by_project(&project_id, &0, &10);
         assert_eq!(records.len(), 0);
+    }
+
+    // ── New: pagination correctness tests ──
+
+    #[test]
+    fn test_pagination_offset_and_limit() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[5u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record 5 retirements for the same retiree
+        for amount in [100i128, 200, 300, 400, 500] {
+            client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
+        }
+
+        assert_eq!(client.retiree_count(&retiree), 5);
+
+        // First page (offset=0, limit=2) → records 0 and 1 → amounts 100, 200
+        let page1 = client.get_retirements_by_retiree(&retiree, &0, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap().amount, 100);
+        assert_eq!(page1.get(1).unwrap().amount, 200);
+
+        // Second page (offset=2, limit=2) → records 2 and 3 → amounts 300, 400
+        let page2 = client.get_retirements_by_retiree(&retiree, &2, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap().amount, 300);
+        assert_eq!(page2.get(1).unwrap().amount, 400);
+
+        // Third page (offset=4, limit=2) → only 1 record remaining → amount 500
+        let page3 = client.get_retirements_by_retiree(&retiree, &4, &2);
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.get(0).unwrap().amount, 500);
+
+        // Page past the end → empty
+        let page4 = client.get_retirements_by_retiree(&retiree, &5, &2);
+        assert_eq!(page4.len(), 0);
+    }
+
+    #[test]
+    fn test_retiree_count_helper() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[6u8; 32]);
+        let purpose = String::from_str(&e, "compliance");
+        let uri = String::from_str(&e, "ipfs://X");
+
+        assert_eq!(client.retiree_count(&retiree), 0);
+        client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri);
+        assert_eq!(client.retiree_count(&retiree), 1);
+        client.record_retirement(&admin, &retiree, &project_id, &200, &purpose, &uri);
+        assert_eq!(client.retiree_count(&retiree), 2);
+    }
+
+    #[test]
+    fn test_project_retirement_count_helper() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[7u8; 32]);
+        let purpose = String::from_str(&e, "community");
+        let uri = String::from_str(&e, "ipfs://Y");
+
+        assert_eq!(client.project_retirement_count(&project_id), 0);
+        client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri);
+        assert_eq!(client.project_retirement_count(&project_id), 1);
     }
 }

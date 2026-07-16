@@ -29,12 +29,23 @@ pub struct ProjectInfo {
     pub area_hectares: u64,
 }
 
+/// Storage key enum.
+///
+/// Instance:   Admin, ProjectCount
+/// Persistent: Project(BytesN<32>)
 #[contracttype]
 pub enum DataKey {
+    // ── Instance ──
     Admin,
     ProjectCount,
+    // ── Persistent ──
     Project(BytesN<32>),
 }
+
+// ── TTL constants ──
+/// Projects are permanent registrations: 10 years.
+const PROJECT_TTL_THRESHOLD: u32 = 63_072_000;
+const PROJECT_TTL_BUMP: u32 = 63_072_000;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -132,9 +143,11 @@ impl CreditFactory {
             area_hectares,
         };
 
+        let proj_key = DataKey::Project(project_id.clone());
+        e.storage().persistent().set(&proj_key, &project);
         e.storage()
-            .instance()
-            .set(&DataKey::Project(project_id.clone()), &project);
+            .persistent()
+            .extend_ttl(&proj_key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
         e.storage()
             .instance()
             .set(&DataKey::ProjectCount, &(count + 1));
@@ -146,7 +159,14 @@ impl CreditFactory {
 
     /// Get project info by its unique ID. Returns None if not found.
     pub fn get_project(e: Env, project_id: BytesN<32>) -> Option<ProjectInfo> {
-        e.storage().instance().get(&DataKey::Project(project_id))
+        let key = DataKey::Project(project_id);
+        let result: Option<ProjectInfo> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
+        }
+        result
     }
 
     /// Update a project's status. Valid statuses: registered, active, completed, suspended.
@@ -157,10 +177,11 @@ impl CreditFactory {
             panic!("unauthorized");
         }
 
+        let key = DataKey::Project(project_id.clone());
         let mut project: ProjectInfo = e
             .storage()
-            .instance()
-            .get(&DataKey::Project(project_id.clone()))
+            .persistent()
+            .get(&key)
             .unwrap_or_else(|| panic!("project not found"));
 
         let valid = status == String::from_str(&e, "registered")
@@ -172,9 +193,10 @@ impl CreditFactory {
         }
 
         project.status = status;
+        e.storage().persistent().set(&key, &project);
         e.storage()
-            .instance()
-            .set(&DataKey::Project(project_id), &project);
+            .persistent()
+            .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
     }
 
     /// Return the total number of registered projects.
@@ -192,10 +214,11 @@ impl CreditFactory {
     ) {
         caller.require_auth();
         let admin = read_admin(&e);
+        let key = DataKey::Project(project_id.clone());
         let mut project: ProjectInfo = e
             .storage()
-            .instance()
-            .get(&DataKey::Project(project_id.clone()))
+            .persistent()
+            .get(&key)
             .unwrap_or_else(|| panic!("project not found"));
 
         if caller != admin && caller != project.owner {
@@ -203,9 +226,10 @@ impl CreditFactory {
         }
 
         project.owner = new_owner;
+        e.storage().persistent().set(&key, &project);
         e.storage()
-            .instance()
-            .set(&DataKey::Project(project_id), &project);
+            .persistent()
+            .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
     }
 }
 

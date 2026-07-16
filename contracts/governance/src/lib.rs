@@ -79,21 +79,35 @@ pub struct VoteCounts {
     pub no: u32,
 }
 
+/// Storage key enum.
+///
+/// Instance:   Admin, Config, MemberCount, ProposalCount, ProtocolPaused,
+///             RegisteredTokens, ActiveProposals
+/// Persistent: Member(Address), Proposal(u64), HasVoted(u64, Address)
 #[contracttype]
 pub enum DataKey {
+    // ── Instance ──
     Admin,
     Config,
-    Member(Address),
     MemberCount,
     ProposalCount,
+    ActiveProposals,
+    ProtocolPaused,
+    RegisteredTokens,
+    // ── Persistent ──
+    Member(Address),
     Proposal(u64),
     HasVoted(u64, Address),
-    ActiveProposals,
-    /// Whether the protocol is currently in emergency-pause state.
-    ProtocolPaused,
-    /// The list of credit token contract addresses to pause/unpause.
-    RegisteredTokens,
 }
+
+// ── TTL constants ──
+/// Members and proposals are long-lived: 2 years.
+const MEMBER_TTL_THRESHOLD: u32 = 12_614_400;
+const MEMBER_TTL_BUMP: u32 = 12_614_400;
+const PROPOSAL_TTL_THRESHOLD: u32 = 12_614_400;
+const PROPOSAL_TTL_BUMP: u32 = 12_614_400;
+const VOTED_TTL_THRESHOLD: u32 = 12_614_400;
+const VOTED_TTL_BUMP: u32 = 12_614_400;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -109,7 +123,7 @@ fn read_config(e: &Env) -> GovernanceConfig {
 
 fn is_member(e: &Env, addr: &Address) -> bool {
     e.storage()
-        .instance()
+        .persistent()
         .get(&DataKey::Member(addr.clone()))
         .unwrap_or(false)
 }
@@ -147,10 +161,19 @@ impl Governance {
         let mut count: u32 = 0;
         for i in 0..initial_members.len() {
             let member = initial_members.get(i).unwrap();
-            if !e.storage().instance().has(&DataKey::Member(member.clone())) {
+            if !e
+                .storage()
+                .persistent()
+                .has(&DataKey::Member(member.clone()))
+            {
                 e.storage()
-                    .instance()
+                    .persistent()
                     .set(&DataKey::Member(member.clone()), &true);
+                e.storage().persistent().extend_ttl(
+                    &DataKey::Member(member.clone()),
+                    MEMBER_TTL_THRESHOLD,
+                    MEMBER_TTL_BUMP,
+                );
                 count += 1;
             }
         }
@@ -168,7 +191,14 @@ impl Governance {
 
     /// Get a proposal by ID. Returns None if not found.
     pub fn get_proposal(e: Env, proposal_id: u64) -> Option<Proposal> {
-        e.storage().instance().get(&DataKey::Proposal(proposal_id))
+        let key = DataKey::Proposal(proposal_id);
+        let result: Option<Proposal> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, PROPOSAL_TTL_THRESHOLD, PROPOSAL_TTL_BUMP);
+        }
+        result
     }
 
     /// Create a new proposal. Only governance members can propose.
@@ -220,8 +250,13 @@ impl Governance {
         };
 
         e.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        e.storage().persistent().extend_ttl(
+            &DataKey::Proposal(proposal_id),
+            PROPOSAL_TTL_THRESHOLD,
+            PROPOSAL_TTL_BUMP,
+        );
 
         let mut active = active;
         active.push_back(proposal_id);
@@ -247,17 +282,16 @@ impl Governance {
             panic!("not a governance member");
         }
 
-        if e.storage()
-            .instance()
-            .has(&DataKey::HasVoted(proposal_id, voter.clone()))
-        {
+        let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
+        if e.storage().persistent().has(&voted_key) {
             panic!("already voted");
         }
 
+        let proposal_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = e
             .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get(&proposal_key)
             .unwrap_or_else(|| panic!("proposal not found"));
 
         let timestamp = e.ledger().timestamp();
@@ -273,9 +307,12 @@ impl Governance {
 
         if timestamp > proposal.voting_ends_at {
             proposal.status = ProposalStatus::Expired;
-            e.storage()
-                .instance()
-                .set(&DataKey::Proposal(proposal_id), &proposal);
+            e.storage().persistent().set(&proposal_key, &proposal);
+            e.storage().persistent().extend_ttl(
+                &proposal_key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
             panic!("voting period ended");
         }
 
@@ -285,12 +322,16 @@ impl Governance {
             proposal.votes_against.push_back(voter.clone());
         }
 
+        e.storage().persistent().set(&voted_key, &true);
         e.storage()
-            .instance()
-            .set(&DataKey::HasVoted(proposal_id, voter.clone()), &true);
-        e.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+            .persistent()
+            .extend_ttl(&voted_key, VOTED_TTL_THRESHOLD, VOTED_TTL_BUMP);
+        e.storage().persistent().set(&proposal_key, &proposal);
+        e.storage().persistent().extend_ttl(
+            &proposal_key,
+            PROPOSAL_TTL_THRESHOLD,
+            PROPOSAL_TTL_BUMP,
+        );
 
         e.events()
             .publish((EVENT_VOTE_CAST,), (proposal_id, voter, approve));
@@ -311,14 +352,20 @@ impl Governance {
             if yes_pct >= config.approval_threshold_bps {
                 proposal.status = ProposalStatus::Approved;
                 proposal.timelock_ends_at = timestamp + config.timelock_duration;
-                e.storage()
-                    .instance()
-                    .set(&DataKey::Proposal(proposal_id), &proposal);
+                e.storage().persistent().set(&proposal_key, &proposal);
+                e.storage().persistent().extend_ttl(
+                    &proposal_key,
+                    PROPOSAL_TTL_THRESHOLD,
+                    PROPOSAL_TTL_BUMP,
+                );
             } else {
                 proposal.status = ProposalStatus::Rejected;
-                e.storage()
-                    .instance()
-                    .set(&DataKey::Proposal(proposal_id), &proposal);
+                e.storage().persistent().set(&proposal_key, &proposal);
+                e.storage().persistent().extend_ttl(
+                    &proposal_key,
+                    PROPOSAL_TTL_THRESHOLD,
+                    PROPOSAL_TTL_BUMP,
+                );
             }
         }
     }
@@ -331,10 +378,11 @@ impl Governance {
             panic!("not a governance member");
         }
 
+        let proposal_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = e
             .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
+            .persistent()
+            .get(&proposal_key)
             .unwrap_or_else(|| panic!("proposal not found"));
 
         if !matches!(proposal.status, ProposalStatus::Approved) {
@@ -389,9 +437,12 @@ impl Governance {
 
         // Mark executed only after all actions succeed (revert-safe ordering).
         proposal.status = ProposalStatus::Executed;
-        e.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+        e.storage().persistent().set(&proposal_key, &proposal);
+        e.storage().persistent().extend_ttl(
+            &proposal_key,
+            PROPOSAL_TTL_THRESHOLD,
+            PROPOSAL_TTL_BUMP,
+        );
 
         e.events()
             .publish((EVENT_PROPOSAL_EXECUTED,), (proposal_id,));
@@ -425,14 +476,19 @@ impl Governance {
             panic!("unauthorized");
         }
         if e.storage()
-            .instance()
+            .persistent()
             .has(&DataKey::Member(new_member.clone()))
         {
             panic!("already a member");
         }
         e.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Member(new_member.clone()), &true);
+        e.storage().persistent().extend_ttl(
+            &DataKey::Member(new_member.clone()),
+            MEMBER_TTL_THRESHOLD,
+            MEMBER_TTL_BUMP,
+        );
         let count: u32 = e.storage().instance().get(&DataKey::MemberCount).unwrap();
         e.storage()
             .instance()
@@ -448,7 +504,11 @@ impl Governance {
         if admin != stored {
             panic!("unauthorized");
         }
-        if !e.storage().instance().has(&DataKey::Member(member.clone())) {
+        if !e
+            .storage()
+            .persistent()
+            .has(&DataKey::Member(member.clone()))
+        {
             panic!("not a member");
         }
         let count: u32 = e.storage().instance().get(&DataKey::MemberCount).unwrap();
@@ -456,7 +516,7 @@ impl Governance {
             panic!("cannot remove last member");
         }
         e.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Member(member.clone()));
         e.storage()
             .instance()
