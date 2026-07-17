@@ -1724,6 +1724,59 @@ mod tests {
         (e, admin, client)
     }
 
+    fn old_insertion_sort_median(e: &Env, values: &Vec<i64>) -> i64 {
+        let mut sorted: Vec<i64> = Vec::new(e);
+        for i in 0..values.len() {
+            let val = values.get(i).unwrap();
+            let mut inserted = false;
+            for j in 0..sorted.len() {
+                if val < sorted.get(j).unwrap() {
+                    sorted.insert(j, val);
+                    inserted = true;
+                    break;
+                }
+            }
+            if !inserted {
+                sorted.push_back(val);
+            }
+        }
+        let len = sorted.len();
+        if len % 2 == 0 {
+            (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
+        } else {
+            sorted.get(len / 2).unwrap()
+        }
+    }
+
+    #[test]
+    fn test_median_even_length_preserves_integer_truncation_semantics() {
+        let e = Env::default();
+        let values = vec![&e, -1i64, 0i64];
+
+        assert_eq!(super::median_i64(&e, &values), 0);
+    }
+
+    #[test]
+    fn test_median_helper_uses_less_budget_than_insertion_sort_for_ten_values() {
+        let e = Env::default();
+        let values = vec![&e, 5i64, 1, 9, 3, 7, 2, 8, 4, 6, 10];
+
+        let mut old_budget = e.budget();
+        old_budget.reset_default();
+        let _ = old_insertion_sort_median(&e, &values);
+        let old_cpu = old_budget.cpu_instruction_cost();
+        let old_mem = old_budget.memory_bytes_cost();
+
+        let mut new_budget = e.budget();
+        new_budget.reset_default();
+        let _ = super::median_i64(&e, &values);
+        let new_cpu = new_budget.cpu_instruction_cost();
+        let new_mem = new_budget.memory_bytes_cost();
+
+        assert!(new_cpu < old_cpu, "expected optimized median to use fewer CPU instructions");
+        assert!(new_mem <= old_mem, "expected optimized median to use no more memory");
+    }
+
     #[test]
     fn test_initialize_sets_default_config() {
         let (_e, _admin, client) = setup_with_client();
